@@ -36,3 +36,4 @@ urllib3==2.5.0
 uvicorn==0.37.0
 websockets==15.0.1
 yfinance==0.2.66
+plotly
