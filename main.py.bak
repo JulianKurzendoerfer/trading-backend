@@ -1,0 +1,82 @@
+from fastapi import FastAPI, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
+import pandas as pd
+import yfinance as yf
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+
+from quant_core import compute_indicators, pack_basic_json
+
+app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # später auf deine Domain einschränken
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+def fetch_df(ticker: str, range_: str = "1y", interval: str = "1d", adj: bool = True) -> pd.DataFrame:
+    hist = yf.Ticker(ticker).history(period=range_, interval=interval, auto_adjust=adj)
+    if hist.empty:
+        return pd.DataFrame()
+    df = hist.copy().dropna()
+    if isinstance(df.index, pd.DatetimeIndex):
+        df.index = pd.to_datetime(df.index)
+    return df
+
+@app.get("/")
+def root():
+    return {"ok": True}
+
+@app.get("/api/indicators")
+def api_indicators(
+    ticker: str = "AAPL",
+    range: str = "1y",
+    interval: str = "1d",
+    adj: bool = True
+):
+    df = fetch_df(ticker, range, interval, adj)
+    if df.empty:
+        return {"series": [], "indicators": {}}
+    df = compute_indicators(df)
+    return pack_basic_json(df)
+
+@app.get("/plot", response_class=HTMLResponse)
+def plot_view(
+    ticker: str = "AAPL",
+    range: str = "1y",
+    interval: str = "1d",
+    adj: bool = True
+):
+    df = fetch_df(ticker, range, interval, adj)
+    if df.empty:
+        return HTMLResponse("<h3>Keine Daten</h3>", status_code=404)
+    df = compute_indicators(df)
+
+    fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.03,
+                        row_heights=[0.6, 0.2, 0.2])
+
+    # Preis + Bollinger + EMA
+    fig.add_trace(go.Scatter(x=df.index, y=df["Close"], name="Close", mode="lines"), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df["BB_upper"], name="BB Upper", mode="lines", line=dict(dash="dot")), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df["BB_basis"], name="BB Mid", mode="lines", line=dict(dash="dash")), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df["BB_lower"], name="BB Lower", mode="lines", line=dict(dash="dot")), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df["EMA9"],  name="EMA9",  mode="lines"), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df["EMA21"], name="EMA21", mode="lines"), row=1, col=1)
+
+    # MACD
+    fig.add_trace(go.Bar(x=df.index, y=df["MACD_hist"], name="MACD hist", opacity=0.4), row=2, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df["MACD"], name="MACD", mode="lines"), row=2, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=df["MACD_sig"], name="Signal", mode="lines"), row=2, col=1)
+
+    # RSI
+    fig.add_trace(go.Scatter(x=df.index, y=df["RSI"], name="RSI(14)", mode="lines"), row=3, col=1)
+    fig.update_yaxes(range=[0,100], row=3, col=1)
+    for y in (30, 50, 70):
+        fig.add_hline(y=y, line_dash="dot", line_color="#999", row=3, col=1)
+
+    fig.update_layout(title=f"{ticker.upper()} – {range} / {interval}", height=900, showlegend=True)
+    html = fig.to_html(full_html=True, include_plotlyjs="cdn")
+    return HTMLResponse(html)
