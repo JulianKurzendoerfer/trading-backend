@@ -1,4 +1,5 @@
 --only-binary=:all:
+
 fastapi==0.114.2
 uvicorn[standard]==0.30.6
 gunicorn==22.0.0
