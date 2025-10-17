@@ -10,3 +10,4 @@ plotly==5.24.1
 yfinance==0.2.40
 pydantic==2.9.2
 httpx==0.27.2
+peewee==3.16.2
