@@ -35,15 +35,36 @@ def root():
 # Aktien-Daten abrufen
 # =====================
 @app.get("/api/stock")
-def get_stock(ticker: str = "AAPL", period: str = "1y", interval: str = "1d"):
-    """
-    Lädt historische Kursdaten mit yfinance.
-    Beispiel: /api/stock?ticker=TSLA&period=6mo&interval=1d
-    """
+def fetch_ohlc(ticker, period, interval):
+    t = yf.Ticker(ticker)
+    # 1) Primär über history()
+    df = t.history(period=period, interval=interval, actions=False, auto_adjust=False)
+    if df is None or df.empty:
+        # 2) Period-Fallbacks (yfinance mag "1mo" manchmal nicht)
+        period_map = {"1mo": "30d", "3mo": "90d", "6mo": "180d", "1y": "365d"}
+        alt_period = period_map.get(period, period)
+        df = t.history(period=alt_period, interval=interval, actions=False, auto_adjust=False)
+    if df is None or df.empty:
+        # 3) Notnagel: download()
+        df = yf.download(
+            ticker, period=period, interval=interval,
+            progress=False, threads=False, auto_adjust=False
+        )
+    return df if df is not None else pd.DataFrame()
+
+@app.get("/api/stock")
+def get_stock(ticker: str = "AAPL", period: str = "1mo", interval: str = "1d"):
     try:
-        data = yf.download(ticker, period=period, interval=interval, progress=False)
+        ticker = ticker.upper().strip()
+        data = fetch_ohlc(ticker, period, interval)
         if data.empty:
             return JSONResponse(content={"error": "Keine Daten gefunden"}, status_code=404)
+
+        # Indikatoren berechnen (unverändert):
+        data["RSI"] = calculate_rsi(data)
+        data["MACD"], data["MACD_signal"] = calculate_macd(data)
+        data["BB_MA"], data["BB_upper"], data["BB_lower"] = calculate_bollinger(data)
+        data["Stoch_K"], data["Stoch_D"] = calculate_stochastic(data)
 
         data.reset_index(inplace=True)
         return data.to_dict(orient="records")
