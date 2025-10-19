@@ -1,73 +1,65 @@
-# ===== Trading Backend (FastAPI) =====
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 import yfinance as yf
 import pandas as pd
 import numpy as np
-from datetime import timedelta
+from datetime import datetime, timedelta
 
-# =====================
-# App-Setup
-# =====================
 app = FastAPI(title="Trading Backend")
 
-# CORS freischalten (Frontend darf API ansprechen)
+# ---- CORS erlauben (Frontend + Domain) ----
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "https://trading-frontend-coje.onrender.com",  # Render-Frontend
-        "https://tool.market-vision-pro.com"           # deine eigene Domain
+        "https://trading-frontend-coje.onrender.com",
+        "https://tool.market-vision-pro.com",
     ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# =====================
-# Test-Endpunkte
-# =====================
-@app.get("/")
-def root():
-    return {"status": "ok", "message": "Trading Backend läuft 🚀"}
+# ---- Hilfsfunktionen / Indikatoren ----
+def rsi(series, period=14):
+    delta = series.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
 
-# =====================
-# Aktien-Daten abrufen
-# =====================
-@app.get("/api/stock")
-def fetch_ohlc(ticker, period, interval):
-    t = yf.Ticker(ticker)
-    # 1) Primär über history()
-    df = t.history(period=period, interval=interval, actions=False, auto_adjust=False)
-    if df is None or df.empty:
-        # 2) Period-Fallbacks (yfinance mag "1mo" manchmal nicht)
-        period_map = {"1mo": "30d", "3mo": "90d", "6mo": "180d", "1y": "365d"}
-        alt_period = period_map.get(period, period)
-        df = t.history(period=alt_period, interval=interval, actions=False, auto_adjust=False)
-    if df is None or df.empty:
-        # 3) Notnagel: download()
-        df = yf.download(
-            ticker, period=period, interval=interval,
-            progress=False, threads=False, auto_adjust=False
-        )
-    return df if df is not None else pd.DataFrame()
+def macd(series, fast=12, slow=26, signal=9):
+    ema_fast = series.ewm(span=fast, adjust=False).mean()
+    ema_slow = series.ewm(span=slow, adjust=False).mean()
+    macd_line = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
+    return macd_line, signal_line
 
+def bollinger(series, window=20, num_std=2):
+    sma = series.rolling(window).mean()
+    std = series.rolling(window).std()
+    return sma, sma + num_std * std, sma - num_std * std
+
+def stochastic(df, k=14, d=3):
+    low_min = df['Low'].rolling(window=k).min()
+    high_max = df['High'].rolling(window=k).max()
+    k_percent = 100 * (df['Close'] - low_min) / (high_max - low_min)
+    d_percent = k_percent.rolling(window=d).mean()
+    return k_percent, d_percent
+
+# ---- API-Route ----
 @app.get("/api/stock")
-def get_stock(ticker: str = "AAPL", period: str = "1mo", interval: str = "1d"):
+async def get_stock(ticker: str, period: str = "1mo", interval: str = "1d"):
     try:
-        ticker = ticker.upper().strip()
-        data = fetch_ohlc(ticker, period, interval)
+        data = yf.download(ticker, period=period, interval=interval, progress=False, threads=False)
         if data.empty:
-            return JSONResponse(content={"error": "Keine Daten gefunden"}, status_code=404)
-
-        # Indikatoren berechnen (unverändert):
-        data["RSI"] = calculate_rsi(data)
-        data["MACD"], data["MACD_signal"] = calculate_macd(data)
-        data["BB_MA"], data["BB_upper"], data["BB_lower"] = calculate_bollinger(data)
-        data["Stoch_K"], data["Stoch_D"] = calculate_stochastic(data)
-
-        data.reset_index(inplace=True)
-        return data.to_dict(orient="records")
-
+            return JSONResponse(content={"error": "Keine Daten gefunden"})
+        df = data.copy()
+        df['RSI'] = rsi(df['Close'])
+        df['MACD'], df['MACD_Signal'] = macd(df['Close'])
+        df['BB_Mid'], df['BB_Upper'], df['BB_Lower'] = bollinger(df['Close'])
+        df['Stoch_K'], df['Stoch_D'] = stochastic(df)
+        return JSONResponse(content=df.tail(60).to_dict())
     except Exception as e:
-        return JSONResponse(content={"error": str(e)}, status_code=500)
+        return JSONResponse(content={"error": str(e)})
+
