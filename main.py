@@ -83,33 +83,43 @@ def fetch_data(ticker, period="1mo", interval="1d"):
 def root():
     return {"status": "ok"}
 
-@app.get("/api/stock")
-def get_stock(ticker: str = Query(...), period: str = Query("1mo"), interval: str = Query("1d")):
-    df = fetch_data(ticker, period, interval)
-    if df.empty:
-        return JSONResponse({"error": "Keine Daten gefunden", "ticker": ticker}, status_code=200)
+from fastapi.responses import JSONResponse
+from datetime import datetime
+import yfinance as yf
 
-    df["RSI"] = rsi(df["Close"])
-    macd_line, signal_line, hist = macd(df["Close"])
-    df["MACD"] = macd_line
-    df["MACD_signal"] = signal_line
-    df["MACD_hist"] = hist
-    ma, upper, lower = bollinger(df["Close"])
-    df["BB_mid"], df["BB_upper"], df["BB_lower"] = ma, upper, lower
-    k, d = stoch(df["High"], df["Low"], df["Close"])
-    df["Stoch_K"], df["Stoch_D"] = k, d
+@app.get("/api/stock", response_class=JSONResponse)
+def get_stock(ticker: str, period: str = "6mo", interval: str = "1d"):
+    """
+    Liefert OHLC-Daten (und funktioniert auch ohne period/interval-Parameter,
+    dank Defaults period=6mo, interval=1d).
+    """
+    try:
+        data = yf.download(
+            ticker,
+            period=period,
+            interval=interval,
+            progress=False,
+            auto_adjust=False,
+        )
 
-    df = df.dropna()
-    out = {
-        "index": [str(i) for i in df.index],
-        "Close": df["Close"].round(2).tolist(),
-        "RSI": df["RSI"].round(2).tolist(),
-        "MACD": df["MACD"].round(2).tolist(),
-        "MACD_signal": df["MACD_signal"].round(2).tolist(),
-        "MACD_hist": df["MACD_hist"].round(2).tolist(),
-        "BB_upper": df["BB_upper"].round(2).tolist(),
-        "BB_lower": df["BB_lower"].round(2).tolist(),
-        "Stoch_K": df["Stoch_K"].round(2).tolist(),
-        "Stoch_D": df["Stoch_D"].round(2).tolist(),
-    }
-    return JSONResponse(out)
+        if data is None or data.empty:
+            return JSONResponse(
+                {"error": "Keine Daten gefunden", "ticker": ticker},
+                status_code=404
+            )
+
+        out = {
+            "index": [
+                d.strftime("%Y-%m-%d %H:%M:%S") if isinstance(d, datetime) else str(d)
+                for d in data.index
+            ],
+            "Open":  [float(x) for x in data["Open"].astype(float).round(2)],
+            "High":  [float(x) for x in data["High"].astype(float).round(2)],
+            "Low":   [float(x) for x in data["Low"].astype(float).round(2)],
+            "Close": [float(x) for x in data["Close"].astype(float).round(2)],
+            "Adj Close": [float(x) for x in data.get("Adj Close", data["Close"]).astype(float).round(2)],
+            "Volume": [int(x) for x in data["Volume"].fillna(0).astype(int)],
+        }
+        return out
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
