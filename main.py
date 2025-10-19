@@ -1,125 +1,244 @@
+# main.py
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-import yfinance as yf
+from datetime import datetime
+from typing import Dict, Any, Optional
+
 import pandas as pd
 import numpy as np
-import requests
+import yfinance as yf
 
+
+# ---------------------------
+# FastAPI + CORS
+# ---------------------------
 app = FastAPI(title="Trading Backend")
 
-# ==== CORS ====
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "https://trading-frontend-coje.onrender.com",
         "https://tool.market-vision-pro.com",
-        "http://localhost:5173"
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
     ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ---- Hilfsindikatoren ----
-def rsi(series, period=14):
-    delta = series.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(period).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(period).mean()
-    rs = gain / loss.replace(0, np.nan)
-    return 100 - (100 / (1 + rs))
 
-def macd(series, fast=12, slow=26, signal=9):
-    ema_fast = series.ewm(span=fast, adjust=False).mean()
-    ema_slow = series.ewm(span=slow, adjust=False).mean()
-    macd_line = ema_fast - ema_slow
-    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
-    hist = macd_line - signal_line
-    return macd_line, signal_line, hist
+# ---------------------------
+# Helpers
+# ---------------------------
+def _is_df_ok(df: Optional[pd.DataFrame]) -> bool:
+    return isinstance(df, pd.DataFrame) and not df.empty and "Close" in df.columns
 
-def bollinger(series, window=20, mult=2.0):
-    ma = series.rolling(window).mean()
-    sd = series.rolling(window).std()
-    return ma, ma + mult * sd, ma - mult * sd
 
-def stoch(high, low, close, k=14, d=3):
-    lowest_low = low.rolling(k).min()
-    highest_high = high.rolling(k).max()
-    k_line = 100 * (close - lowest_low) / (highest_high - lowest_low)
-    d_line = k_line.rolling(d).mean()
-    return k_line, d_line
-
-# ---- Datenabruf mit Fallback ----
-def fetch_data(ticker, period="1mo", interval="1d"):
-    # Erst yfinance
+def _clean_index(df: pd.DataFrame) -> pd.DataFrame:
+    """Index -> ISO Datetime-String, tz-frei (stabile JSON-Keys)."""
+    out = df.copy()
     try:
-        df = yf.download(ticker, period=period, interval=interval, progress=False)
-        if not df.empty:
+        out.index = pd.to_datetime(out.index)
+        out.index = out.index.tz_localize(None)
+        out.index = out.index.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        pass
+    return out
+
+
+def _as_ohlc_json(df: pd.DataFrame) -> Dict[str, Any]:
+    cols = {
+        "Open": "Open",
+        "High": "High",
+        "Low": "Low",
+        "Close": "Close",
+        "Adj Close": "Adj Close" if "Adj Close" in df.columns else "Close",
+        "Volume": "Volume",
+    }
+    out: Dict[str, Any] = {}
+    for key, col in cols.items():
+        if col in df.columns:
+            s = df[col]
+            if key != "Volume":
+                s = s.round(4)
+            else:
+                s = s.fillna(0).astype(int)
+            out[key] = s.dropna().to_dict()
+    return out
+
+
+def _compute_indicators(df: pd.DataFrame) -> Dict[str, Any]:
+    """RSI(14), MACD(12,26,9), Bollinger(20,2), Stoch(14,3)."""
+    out: Dict[str, Any] = {}
+    d = df.copy()
+
+    if not _is_df_ok(d):
+        return out
+
+    close = d["Close"]
+
+    # RSI 14
+    try:
+        delta = close.diff()
+        gain = delta.clip(lower=0)
+        loss = (-delta).clip(lower=0)
+        roll = 14
+        avg_gain = gain.rolling(roll, min_periods=roll).mean()
+        avg_loss = loss.rolling(roll, min_periods=roll).mean()
+        rs = avg_gain / (avg_loss.replace(0, np.nan))
+        rsi = 100 - (100 / (1 + rs))
+        rsi = rsi.round(2)
+        out["RSI"] = rsi.dropna().to_dict()
+    except Exception:
+        pass
+
+    # MACD 12/26 + Signal 9
+    try:
+        ema12 = close.ewm(span=12, adjust=False).mean()
+        ema26 = close.ewm(span=26, adjust=False).mean()
+        macd = ema12 - ema26
+        signal = macd.ewm(span=9, adjust=False).mean()
+        hist = macd - signal
+        out["MACD"] = {
+            "macd": macd.round(4).dropna().to_dict(),
+            "signal": signal.round(4).dropna().to_dict(),
+            "hist": hist.round(4).dropna().to_dict(),
+        }
+    except Exception:
+        pass
+
+    # Bollinger 20, 2
+    try:
+        m = close.rolling(20, min_periods=20).mean()
+        s = close.rolling(20, min_periods=20).std(ddof=0)
+        upper = (m + 2 * s).round(4)
+        lower = (m - 2 * s).round(4)
+        mid = m.round(4)
+        out["Bollinger"] = {
+            "upper": upper.dropna().to_dict(),
+            "middle": mid.dropna().to_dict(),
+            "lower": lower.dropna().to_dict(),
+        }
+    except Exception:
+        pass
+
+    # Stochastic 14,3
+    try:
+        low14 = d["Low"].rolling(14, min_periods=14).min()
+        high14 = d["High"].rolling(14, min_periods=14).max()
+        stoch_k = ((close - low14) / (high14 - low14) * 100).rolling(3, min_periods=3).mean()
+        stoch_d = stoch_k.rolling(3, min_periods=3).mean()
+        out["Stoch"] = {
+            "%K": stoch_k.round(2).dropna().to_dict(),
+            "%D": stoch_d.round(2).dropna().to_dict(),
+        }
+    except Exception:
+        pass
+
+    return out
+
+
+def _period_fallbacks(period: str) -> list[str]:
+    """
+    Alternative Perioden, falls Yahoo für den gewünschten Zeitraum leer liefert.
+    """
+    mapping = {
+        "5d": ["10d", "14d", "1mo"],
+        "1mo": ["30d", "45d", "2mo"],
+        "3mo": ["90d", "120d", "6mo"],
+        "6mo": ["180d", "365d", "1y"],
+        "1y": ["365d", "18mo", "2y"],
+        "2y": ["730d", "3y"],
+    }
+    return mapping.get(period, ["30d", "90d", "180d"])
+
+
+def fetch_with_fallbacks(ticker: str, period: str, interval: str) -> pd.DataFrame:
+    """
+    Robust: download -> history -> alternative Perioden.
+    """
+    # 1) download
+    df = yf.download(
+        tickers=ticker,
+        period=period,
+        interval=interval,
+        auto_adjust=False,
+        progress=False,
+        threads=False,
+    )
+    if _is_df_ok(df):
+        return df
+
+    # 2) history
+    try:
+        t = yf.Ticker(ticker)
+        df = t.history(period=period, interval=interval, auto_adjust=False)
+        if _is_df_ok(df):
             return df
     except Exception:
         pass
 
-    # Fallback: TwelveData-API (kostenlos, aber limitiert)
-    try:
-        url = f"https://api.twelvedata.com/time_series?symbol={ticker}&interval={interval}&outputsize=100&apikey=demo"
-        r = requests.get(url, timeout=10)
-        data = r.json()
-        if "values" in data:
-            df = pd.DataFrame(data["values"])
-            df["datetime"] = pd.to_datetime(df["datetime"])
-            df = df.sort_values("datetime")
-            df = df.rename(columns={
-                "open": "Open", "high": "High", "low": "Low", "close": "Close", "volume": "Volume"
-            })
-            df.set_index("datetime", inplace=True)
-            df = df.astype(float)
-            return df
-    except Exception:
-        pass
+    # 3) alternative Perioden probieren
+    for alt in _period_fallbacks(period):
+        try:
+            df = yf.download(
+                tickers=ticker,
+                period=alt,
+                interval=interval,
+                auto_adjust=False,
+                progress=False,
+                threads=False,
+            )
+            if _is_df_ok(df):
+                return df
+        except Exception:
+            continue
 
-    return pd.DataFrame()
+    return pd.DataFrame()  # leer => kein Erfolg
 
-@app.get("/")
+
+# ---------------------------
+# Endpoints
+# ---------------------------
+@app.get("/", response_class=JSONResponse)
 def root():
+    return {"status": "ok", "ts": datetime.utcnow().isoformat() + "Z"}
+
+
+@app.get("/healthz", response_class=JSONResponse)
+def healthz():
     return {"status": "ok"}
 
-from fastapi.responses import JSONResponse
-from datetime import datetime
-import yfinance as yf
 
 @app.get("/api/stock", response_class=JSONResponse)
-def get_stock(ticker: str, period: str = "6mo", interval: str = "1d"):
-    """
-    Liefert OHLC-Daten (und funktioniert auch ohne period/interval-Parameter,
-    dank Defaults period=6mo, interval=1d).
-    """
+def api_stock(
+    ticker: str = Query(..., description="Symbol, z. B. AAPL"),
+    period: str = Query("1mo", description="z. B. 5d, 1mo, 3mo, 6mo, 1y"),
+    interval: str = Query("1d", description="z. B. 1d, 1h, 30m, 15m"),
+    indicators: bool = Query(True, description="RSI/MACD/Bollinger/Stoch mitliefern"),
+) -> Any:
     try:
-        data = yf.download(
-            ticker,
-            period=period,
-            interval=interval,
-            progress=False,
-            auto_adjust=False,
-        )
+        df = fetch_with_fallbacks(ticker, period, interval)
+        if not _is_df_ok(df):
+            return JSONResponse({"error": "Keine Daten gefunden", "ticker": ticker})
 
-        if data is None or data.empty:
-            return JSONResponse(
-                {"error": "Keine Daten gefunden", "ticker": ticker},
-                status_code=404
-            )
+        df = _clean_index(df)
 
-        out = {
-            "index": [
-                d.strftime("%Y-%m-%d %H:%M:%S") if isinstance(d, datetime) else str(d)
-                for d in data.index
-            ],
-            "Open":  [float(x) for x in data["Open"].astype(float).round(2)],
-            "High":  [float(x) for x in data["High"].astype(float).round(2)],
-            "Low":   [float(x) for x in data["Low"].astype(float).round(2)],
-            "Close": [float(x) for x in data["Close"].astype(float).round(2)],
-            "Adj Close": [float(x) for x in data.get("Adj Close", data["Close"]).astype(float).round(2)],
-            "Volume": [int(x) for x in data["Volume"].fillna(0).astype(int)],
+        payload: Dict[str, Any] = {
+            "meta": {
+                "ticker": ticker.upper(),
+                "period": period,
+                "interval": interval,
+            },
+            "ohlc": _as_ohlc_json(df),
         }
-        return out
+
+        if indicators:
+            payload["indicators"] = _compute_indicators(df)
+
+        return payload
+
     except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
+        return JSONResponse({"error": str(e), "ticker": ticker})
