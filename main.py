@@ -3,13 +3,13 @@ from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import pandas as pd
 import requests, io, time, logging
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 import yfinance as yf
 
 app = FastAPI(title="Trading Backend")
 
-# CORS
+# CORS weit offen (Frontend auf Render)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -20,10 +20,9 @@ app.add_middleware(
 
 log = logging.getLogger("uvicorn.error")
 
-# --- kleine Utils ------------------------------------------------------------
-
-UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                    "(KHTML, like Gecko) Chrome/119.0 Safari/537.36"}
+UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/119.0 Safari/537.36"}
 
 def _period_to_days(p:str) -> int:
     p = (p or "").lower()
@@ -33,24 +32,34 @@ def _period_to_days(p:str) -> int:
     }.get(p, 370)
 
 def _trim_to_period(df: pd.DataFrame, period: str) -> pd.DataFrame:
+    """Schneidet auf gewünschte Periode – **immer in UTC** vergleichen,
+    um tz-naive vs. tz-aware Fehler sicher zu vermeiden."""
     days = _period_to_days(period)
-    since = pd.Timestamp.utcnow().normalize() - timedelta(days=days)
+    since_utc = (pd.Timestamp.now(tz="UTC").normalize() - timedelta(days=days))
+
+    col = None
     if "Date" in df.columns:
-        m = pd.to_datetime(df["Date"]) >= since
-        return df.loc[m].reset_index(drop=True)
-    if "index" in df.columns:
-        m = pd.to_datetime(df["index"]) >= since
-        return df.loc[m].reset_index(drop=True)
+        col = "Date"
+    elif "index" in df.columns:
+        col = "index"
+
+    if col:
+        s = pd.to_datetime(df[col], utc=True, errors="coerce")
+        mask = s >= since_utc
+        df = df.loc[mask].reset_index(drop=True)
+
+        # Wir behalten eine einheitliche Namensgebung bei
+        if col != "index":
+            df = df.rename(columns={col: "index"})
+        else:
+            # sicherstellen, dass Spaltenname wirklich "index" ist (falls Multi-Index o.ä.)
+            df = df.rename(columns={"index": "index"})
     return df
 
-# --- Stooq (Daily) -----------------------------------------------------------
-
 def fetch_stooq_daily(ticker: str) -> pd.DataFrame:
-    """
-    Holt Daily-Daten von stooq.com (CSV). Für US-Ticker benötigt Stooq ein '.us'-Suffix.
-    """
+    """Daily OHLC von stooq.com (sehr stabil). Für US-Ticker '.us' Suffix."""
     t = ticker.lower()
-    if "." not in t:  # wenn kein Suffix, US annehmen
+    if "." not in t:
         t = f"{t}.us"
     url = f"https://stooq.com/q/d/l/?s={t}&i=d"
     log.info(f"stooq GET {url}")
@@ -58,18 +67,14 @@ def fetch_stooq_daily(ticker: str) -> pd.DataFrame:
     if r.status_code != 200 or not r.text or "No data" in r.text:
         raise RuntimeError(f"stooq empty ({r.status_code})")
     df = pd.read_csv(io.StringIO(r.text))
-    # Erwartete Spalten: Date,Open,High,Low,Close,Volume
+    # Erwartet: Date,Open,High,Low,Close,Volume
     if df.empty or "Date" not in df.columns or "Close" not in df.columns:
         raise RuntimeError("stooq malformed")
     df = df.dropna(subset=["Close"]).reset_index(drop=True)
     return df
 
-# --- yfinance (flexibel) -----------------------------------------------------
-
 def fetch_yf_any(ticker: str, period: str, interval: str) -> pd.DataFrame:
-    """
-    Versucht mehrere period/interval-Kombis, bis Daten kommen.
-    """
+    """yfinance mit Fallback-Kombis und Retries."""
     combos = [
         (period or "1y", interval or "1d"),
         ("6mo", "1d"),
@@ -87,7 +92,10 @@ def fetch_yf_any(ticker: str, period: str, interval: str) -> pd.DataFrame:
         for attempt in range(3):
             try:
                 log.info(f"yfinance history {ticker} period={per} interval={itv} attempt={attempt+1}")
-                df = yf.Ticker(ticker).history(period=per, interval=itv, auto_adjust=False, repair=True, prepost=False)
+                df = yf.Ticker(ticker).history(
+                    period=per, interval=itv,
+                    auto_adjust=False, repair=True, prepost=False
+                )
                 if not df.empty:
                     df = df.reset_index().rename(columns={"Date": "index"})
                     return df, (per, itv), tried
@@ -96,11 +104,9 @@ def fetch_yf_any(ticker: str, period: str, interval: str) -> pd.DataFrame:
             time.sleep(0.8 * (attempt + 1))
     raise RuntimeError(f"yfinance returned empty for all combos | tried={tried}")
 
-# --- API ---------------------------------------------------------------------
-
 @app.get("/")
 def root():
-    return {"status": "ok", "ts": datetime.utcnow().isoformat()}
+    return {"status": "ok", "ts": pd.Timestamp.utcnow().isoformat()}
 
 @app.get("/api/stock")
 def get_stock(
@@ -108,44 +114,40 @@ def get_stock(
     period: str = Query("1y"),
     interval: str = Query("1d"),
 ):
-    """
-    Liefert OHLC + Meta.
-    - Daily (1d): bevorzugt Stooq, danach yfinance.
-    - Intraday: yfinance.
-    """
+    """OHLC + Meta. Daily über Stooq (falls möglich), sonst yfinance."""
     try:
         src = None
         used = None
 
         if (interval or "").lower() == "1d":
-            # 1) Stooq zuerst (sehr stabil)
             try:
                 df = fetch_stooq_daily(ticker)
                 src = "stooq"
                 used = (period, "1d")
             except Exception as se:
                 log.warning(f"stooq fallback to yfinance: {se}")
-                # 2) yfinance als Fallback
-                df, used, tried = fetch_yf_any(ticker, period, "1d")
+                df, used, _ = fetch_yf_any(ticker, period, "1d")
                 src = "yfinance"
         else:
-            # Intraday & rest: yfinance
-            df, used, tried = fetch_yf_any(ticker, period, interval)
+            df, used, _ = fetch_yf_any(ticker, period, interval)
             src = "yfinance"
 
-        # auf gewünschte Periode begrenzen (bei Stooq sinnvoll)
+        # robust auf Periode trimmen (UTC)
         df = _trim_to_period(df, period)
 
-        # vereinheitlichte Ausgabe
-        if "index" not in df.columns and "Date" in df.columns:
-            df = df.rename(columns={"Date": "index"})
+        # Ausgabestruktur vereinheitlichen
+        cols = df.columns
+        def col(name):
+            return name if name in cols else None
+
         out = {
-            "index": df.get("index", pd.Series(dtype=str)).astype(str).tolist(),
-            "Open":  df.get("Open",  pd.Series()).astype(float).fillna("").tolist(),
-            "High":  df.get("High",  pd.Series()).astype(float).fillna("").tolist(),
-            "Low":   df.get("Low",   pd.Series()).astype(float).fillna("").tolist(),
-            "Close": df.get("Close", pd.Series()).astype(float).fillna("").tolist(),
-            "Volume": df.get("Volume", pd.Series()).fillna("").tolist(),
+            "index":  pd.to_datetime(df[col("index")] if col("index") else pd.Series([], dtype="datetime64[ns]"),
+                                     utc=True, errors="coerce").astype(str).tolist(),
+            "Open":   (df[col("Open")]   if col("Open")   else pd.Series([], dtype="float64")).astype(float).fillna("").tolist(),
+            "High":   (df[col("High")]   if col("High")   else pd.Series([], dtype="float64")).astype(float).fillna("").tolist(),
+            "Low":    (df[col("Low")]    if col("Low")    else pd.Series([], dtype="float64")).astype(float).fillna("").tolist(),
+            "Close":  (df[col("Close")]  if col("Close")  else pd.Series([], dtype="float64")).astype(float).fillna("").tolist(),
+            "Volume": (df[col("Volume")] if col("Volume") else pd.Series([], dtype="float64")).fillna("").tolist(),
             "meta": {
                 "ticker": ticker,
                 "source": src,
