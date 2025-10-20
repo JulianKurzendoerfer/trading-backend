@@ -1,235 +1,208 @@
-# main.py — robust: Stooq daily zuerst, dann yfinance-Fallback; Cache, CORS, 2 Worker empfohlen
-
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from datetime import datetime, timedelta
+from typing import Dict, Any, Optional, Tuple
 import pandas as pd
 import numpy as np
 import yfinance as yf
 import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-from datetime import datetime
-from typing import Dict, Any, List, Tuple
-from io import StringIO
+from pandas_datareader import data as pdr
 
-# ---------- HTTP Session mit Retries ----------
-def make_session() -> requests.Session:
-    s = requests.Session()
-    s.headers.update({
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                      "Chrome/124.0 Safari/537.36"
-    })
-    retry = Retry(
-        total=3,
-        backoff_factor=0.6,
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["GET", "POST", "HEAD", "OPTIONS"],
-        raise_on_status=False,
-    )
-    s.mount("https://", HTTPAdapter(max_retries=retry))
-    s.mount("http://", HTTPAdapter(max_retries=retry))
-    return s
-
-SESSION = make_session()
-
-# ---------- App + CORS ----------
+# --------------------------
+# FastAPI App + CORS
+# --------------------------
 app = FastAPI(title="Trading Backend")
+
+# ➜ Trage hier deine Frontend-URL(s) ein; auf Render ist das z. B.:
+# https://trading-frontend-coje.onrender.com
+ALLOWED_ORIGINS = [
+    "https://trading-frontend-coje.onrender.com",
+    # Optional (eigene Domain später):
+    # "https://tool.market-vision-pro.com",
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://trading-frontend-coje.onrender.com",
-        "http://localhost:5173",
-        "https://tool.market-vision-pro.com",
-        "*",
-    ],
+    allow_origins=ALLOWED_ORIGINS + ["http://localhost:5173", "http://127.0.0.1:5173"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ---------- kleiner Memory-Cache (10 min) ----------
-CACHE: Dict[str, Dict[str, Any]] = {}
-CACHE_TTL = 600
+# --------------------------
+# Kleiner In-Memory-Cache (5 Min)
+# --------------------------
+CACHE: Dict[Tuple[str, Optional[str], Optional[str]], Dict[str, Any]] = {}
+CACHE_TTL_SECONDS = 300  # 5 Minuten
 
-def cache_get(key: str):
+def _cache_get(key):
     item = CACHE.get(key)
     if not item:
         return None
-    if (datetime.utcnow() - item["ts"]).total_seconds() > CACHE_TTL:
+    if datetime.utcnow() > item["exp"]:
         CACHE.pop(key, None)
         return None
-    return item["data"]
+    return item["val"]
 
-def cache_set(key: str, data: Any):
-    CACHE[key] = {"ts": datetime.utcnow(), "data": data}
+def _cache_set(key, val):
+    CACHE[key] = {"val": val, "exp": datetime.utcnow() + timedelta(seconds=CACHE_TTL_SECONDS)}
 
-# ---------- Indikatoren ----------
-def rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    delta = series.diff()
-    gain = np.where(delta > 0, delta, 0.0)
-    loss = np.where(delta < 0, -delta, 0.0)
-    roll_up = pd.Series(gain, index=series.index).rolling(period).mean()
-    roll_down = pd.Series(loss, index=series.index).rolling(period).mean()
-    rs = roll_up / roll_down
-    return 100.0 - (100.0 / (1.0 + rs))
+# --------------------------
+# Utils
+# --------------------------
+def make_session() -> requests.Session:
+    """Requests-Session mit UA, damit Yahoo weniger zickt."""
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+    })
+    return s
 
-def macd(series: pd.Series, fast=12, slow=26, signal=9) -> Tuple[pd.Series, pd.Series]:
-    ema_fast = series.ewm(span=fast, adjust=False).mean()
-    ema_slow = series.ewm(span=slow, adjust=False).mean()
-    macd_line = ema_fast - ema_slow
-    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
-    return macd_line, signal_line
+def df_to_payload(df: pd.DataFrame) -> Dict[str, Any]:
+    """Standardisiertes JSON für Frontend. Index als ISO-String."""
+    out = {}
+    # Index vereinheitlichen
+    if not isinstance(df.index, pd.DatetimeIndex):
+        # Stooq kommt oft mit Date-Index; konvertieren
+        df.index = pd.to_datetime(df.index)
 
-def bollinger(series: pd.Series, window=20, num_std=2) -> Tuple[pd.Series, pd.Series]:
-    ma = series.rolling(window).mean()
-    std = series.rolling(window).std()
-    return ma + num_std * std, ma - num_std * std
+    out["index"] = [d.strftime("%Y-%m-%d %H:%M:%S") for d in df.index]
 
-def stochastic(high: pd.Series, low: pd.Series, close: pd.Series, k_window=14, d_window=3):
-    lowest_low = low.rolling(k_window).min()
-    highest_high = high.rolling(k_window).max()
-    k = 100 * (close - lowest_low) / (highest_high - lowest_low)
-    d = k.rolling(d_window).mean()
-    return k, d
+    # Normale OHLCV Felder, nur wenn vorhanden
+    for col in ["Open", "High", "Low", "Close", "Adj Close", "Volume"]:
+        if col in df.columns:
+            # NaN → None, damit JSON sauber ist
+            vals = df[col].replace({np.nan: None}).tolist()
+            out[col] = vals
 
-def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    out["RSI"] = rsi(out["Close"]).round(2)
-    macd_line, sig = macd(out["Close"])
-    out["MACD"] = macd_line.round(4)
-    out["MACD_signal"] = sig.round(4)
-    up, lo = bollinger(out["Close"])
-    out["BB_upper"] = up.round(4)
-    out["BB_lower"] = lo.round(4)
-    k, d = stochastic(out["High"], out["Low"], out["Close"])
-    out["Stoch_K"] = k.round(2)
-    out["Stoch_D"] = d.round(2)
+    # Ein paar leichte Indikatoren (optional, falls Frontend sie anzeigt)
+    close = df["Close"] if "Close" in df.columns else None
+    if close is not None:
+        try:
+            sma20 = close.rolling(20).mean().replace({np.nan: None}).tolist()
+            sma50 = close.rolling(50).mean().replace({np.nan: None}).tolist()
+            out["SMA20"] = sma20
+            out["SMA50"] = sma50
+        except Exception:
+            pass
+
     return out
 
-# ---------- Datenquellen ----------
-def dl_stooq_csv(ticker: str) -> pd.DataFrame:
-    """Daily OHLC von Stooq (stabil, kein Key)."""
-    for code in [f"{ticker}.US", ticker]:
-        url = f"https://stooq.com/q/d/l/?s={code.lower()}&i=d"
+# --------------------------
+# Datenquellen
+# --------------------------
+def fetch_stooq_daily(ticker: str) -> Optional[pd.DataFrame]:
+    """Stooq liefert Daily-Daten. Wir versuchen Ticker & Ticker.US."""
+    for sym in [ticker, f"{ticker}.US"]:
         try:
-            r = SESSION.get(url, timeout=15)
-            if not r.ok or "Date,Open,High,Low,Close,Volume" not in r.text:
-                continue
-            df = pd.read_csv(StringIO(r.text))
-            if df.empty:
-                continue
-            df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-            df = df.dropna(subset=["Date"]).sort_values("Date").reset_index(drop=True)
-            return df[["Date", "Open", "High", "Low", "Close", "Volume"]]
+            df = pdr.DataReader(sym, "stooq")
+            if df is not None and not df.empty:
+                df = df.sort_index()  # Stooq kommt oft absteigend
+                # Spaltennamen harmonisieren
+                for alt, std in [("Open", "Open"), ("High", "High"), ("Low", "Low"),
+                                 ("Close", "Close"), ("Volume", "Volume")]:
+                    if alt not in df.columns and std in df.columns:
+                        pass  # ist ok
+                return df
         except Exception:
             continue
-    return pd.DataFrame()
+    return None
 
-def dl_yfinance(ticker: str, period: str, interval: str) -> pd.DataFrame:
-    """yfinance; bei 429/Fehler leere DF zurück (wir loggen nur)."""
+def fetch_yfinance(ticker: str, period: str, interval: str, session: requests.Session) -> Optional[pd.DataFrame]:
+    """Ein Aufruf an Yahoo mit Session/UA; None bei leeren Frames."""
     try:
         df = yf.download(
             tickers=ticker,
             period=period,
             interval=interval,
-            auto_adjust=False,
             progress=False,
-            session=SESSION,
+            session=session,
+            auto_adjust=False,
             threads=False,
         )
-        if isinstance(df, pd.DataFrame) and not df.empty:
-            df = df.rename(columns=str.title)
-            if "Datetime" in df.columns:
-                df = df.rename(columns={"Datetime": "Date"})
-            if "Date" not in df.columns:
-                df = df.reset_index()
-            if not pd.api.types.is_datetime64_any_dtype(df["Date"]):
-                df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-            df = df.dropna(subset=["Date"]).sort_values("Date").reset_index(drop=True)
+        if df is not None and not df.empty:
+            # YF liefert MultiIndex in manchen Intervallen; flachziehen
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = [" ".join(col).strip() for col in df.columns.values]
+            # Einheitliche Namen soweit möglich
+            for col in ["Open","High","Low","Close","Adj Close","Volume"]:
+                if col not in df.columns:
+                    # Versuche Varianten zu mappen (z.B. 'Adj Close' fehlt manchmal)
+                    pass
             return df
     except Exception:
-        pass
-    return pd.DataFrame()
+        return None
+    return None
 
-def candidate_matrix(req_period: str | None, req_interval: str | None) -> List[Tuple[str, str]]:
-    combos: List[Tuple[str, str]] = []
-    if req_period and req_interval:
-        combos.append((req_period, req_interval))
+def fetch_with_fallbacks(ticker: str, req_period: Optional[str], req_interval: Optional[str]) -> Dict[str, Any]:
+    """
+    1) Stooq (Daily) zuerst.
+    2) Falls leer, Yahoo mit mehreren Kombis oder der gewünschten Kombi.
+    """
+    # 1) Stooq (stabil, daily)
+    df = fetch_stooq_daily(ticker)
+    if df is not None and not df.empty:
+        payload = df_to_payload(df)
+        payload.update({"used_source": "stooq", "used_period": "1y", "used_interval": "1d"})
+        return payload
+
+    # 2) Yahoo-Fallbacks
+    session = make_session()
+
+    # Wenn der Client period/interval mitgibt, probieren wir das zuerst…
+    combos = []
+    if req_period or req_interval:
+        combos.append((req_period or "1y", req_interval or "1d"))
+
+    # …danach bewährte Kombinationen
     combos += [
         ("1mo", "1d"),
-        ("30d", "1d"),
         ("3mo", "1d"),
         ("6mo", "1d"),
         ("1y", "1d"),
-        ("60d", "1h"),
-        ("5d", "15m"),
+        ("5d", "1h"),  # etwas intraday
+        ("1d", "15m"),
     ]
-    seen, uniq = set(), []
-    for p, i in combos:
-        k = f"{p}|{i}"
-        if k not in seen:
-            seen.add(k)
-            uniq.append((p, i))
-    return uniq
 
-def df_to_payload(df: pd.DataFrame, meta: Dict[str, Any]) -> Dict[str, Any]:
-    payload = {
-        "index": df["Date"].astype(str).tolist(),
-        "Open": df["Open"].round(4).tolist(),
-        "High": df["High"].round(4).tolist(),
-        "Low": df["Low"].round(4).tolist(),
-        "Close": df["Close"].round(4).tolist(),
-        "Volume": df["Volume"].astype(float).tolist(),
-        "RSI": df["RSI"].fillna(None).tolist(),
-        "MACD": df["MACD"].fillna(None).tolist(),
-        "MACD_signal": df["MACD_signal"].fillna(None).tolist(),
-        "BB_upper": df["BB_upper"].fillna(None).tolist(),
-        "BB_lower": df["BB_lower"].fillna(None).tolist(),
-        "Stoch_K": df["Stoch_K"].fillna(None).tolist(),
-        "Stoch_D": df["Stoch_D"].fillna(None).tolist(),
-    }
-    payload.update(meta)
-    return payload
+    tried = []
+    for period, interval in combos:
+        period = period or "1y"
+        interval = interval or "1d"
+        tried.append((period, interval))
+        df = fetch_yfinance(ticker, period, interval, session=session)
+        if df is not None and not df.empty:
+            payload = df_to_payload(df)
+            payload.update({"used_source": "yfinance", "used_period": period, "used_interval": interval})
+            return payload
 
-# ---------- Routes ----------
-@app.get("/")
+    return {"error": "Keine Daten gefunden", "ticker": ticker, "tried": tried}
+
+# --------------------------
+# Routes
+# --------------------------
+@app.get("/", response_class=JSONResponse)
 def root():
     return {"status": "ok", "ts": datetime.utcnow().isoformat()}
 
-@app.get("/api/stock")
-def get_stock(
-    ticker: str = Query(..., description="z. B. AAPL"),
-    period: str | None = Query(None),
-    interval: str | None = Query(None),
+@app.get("/api/stock", response_class=JSONResponse)
+def api_stock(
+    request: Request,
+    ticker: str = Query(...),
+    period: Optional[str] = Query(None),
+    interval: Optional[str] = Query(None),
 ):
-    t = ticker.strip().upper()
-    cache_key = f"{t}|{period}|{interval}"
-    cached = cache_get(cache_key)
-    if cached:
+    key = (ticker.upper(), period, interval)
+
+    cached = _cache_get(key)
+    if cached is not None:
         return cached
 
-    tried: List[Tuple[str, str]] = []
+    data = fetch_with_fallbacks(ticker.upper(), period, interval)
+    if "error" in data:
+        # Kein 500, sondern 200 mit Fehlertext → Frontend kann sinnvoll reagieren
+        return JSONResponse(data)
 
-    # 1) ZUERST: Stooq (Daily) – vermeidet Yahoo-429
-    stooq_df = dl_stooq_csv(t)
-    if not stooq_df.empty:
-        df = add_indicators(stooq_df)
-        meta = {"source": "stooq", "used_period": "max", "used_interval": "1d"}
-        payload = df_to_payload(df, meta)
-        cache_set(cache_key, payload)
-        return payload
-
-    # 2) Dann yfinance – mehrere period/interval-Kombis
-    for p, iv in candidate_matrix(period, interval):
-        df_yf = dl_yfinance(t, p, iv)
-        if not df_yf.empty:
-            df = add_indicators(df_yf)
-            meta = {"source": "yfinance", "used_period": p, "used_interval": iv}
-            payload = df_to_payload(df, meta)
-            cache_set(cache_key, payload)
-            return payload
-        tried.append((p, iv))
-
-    # 3) Nichts gefunden
-    return JSONResponse({"error": "Keine Daten gefunden", "ticker": t, "tried": tried}, status_code=502)
+    _cache_set(key, data)
+    return data
