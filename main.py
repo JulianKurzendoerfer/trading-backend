@@ -1,244 +1,221 @@
 # main.py
-from fastapi import FastAPI, Query
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from datetime import datetime
-from typing import Dict, Any, Optional
+import os
+import time
+from datetime import datetime, timedelta
+from typing import Literal, Optional, Tuple
 
 import pandas as pd
 import numpy as np
 import yfinance as yf
+import requests
 
+from fastapi import FastAPI, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
-# ---------------------------
-# FastAPI + CORS
-# ---------------------------
+# -------------------------------------------------
+# Konfiguration
+# -------------------------------------------------
+FRONTEND_ORIGINS = [
+    "https://trading-frontend-coje.onrender.com",
+    "https://tool.market-vision-pro.com",  # falls du die Domain nutzt
+]
+
+# Stabilere yfinance-Session (User-Agent gegen Blocks)
+_requests_session = requests.Session()
+_requests_session.headers.update({
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/127.0 Safari/537.36"
+})
+
+# yfinance-Defaults
+YF_KWARGS = dict(
+    auto_adjust=True,  # Dividenden/Splits korrigiert – stabilere Charts
+    prepost=False,
+    progress=False,
+    threads=True,
+    session=_requests_session,
+)
+
+# Unterstützte Kombis – wir probieren diese Reihenfolge nacheinander
+RANGE_MATRIX: Tuple[Tuple[str, str], ...] = (
+    ("30d", "1d"),
+    ("1mo", "1d"),
+    ("3mo", "1d"),
+    ("6mo", "1d"),
+    ("1y", "1d"),
+)
+
+# -------------------------------------------------
+# FastAPI
+# -------------------------------------------------
 app = FastAPI(title="Trading Backend")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://trading-frontend-coje.onrender.com",
-        "https://tool.market-vision-pro.com",
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-    ],
+    allow_origins=FRONTEND_ORIGINS + ["http://localhost:5173", "http://127.0.0.1:5173"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-# ---------------------------
-# Helpers
-# ---------------------------
-def _is_df_ok(df: Optional[pd.DataFrame]) -> bool:
-    return isinstance(df, pd.DataFrame) and not df.empty and "Close" in df.columns
-
-
-def _clean_index(df: pd.DataFrame) -> pd.DataFrame:
-    """Index -> ISO Datetime-String, tz-frei (stabile JSON-Keys)."""
-    out = df.copy()
-    try:
-        out.index = pd.to_datetime(out.index)
-        out.index = out.index.tz_localize(None)
-        out.index = out.index.strftime("%Y-%m-%d %H:%M:%S")
-    except Exception:
-        pass
-    return out
-
-
-def _as_ohlc_json(df: pd.DataFrame) -> Dict[str, Any]:
-    cols = {
-        "Open": "Open",
-        "High": "High",
-        "Low": "Low",
-        "Close": "Close",
-        "Adj Close": "Adj Close" if "Adj Close" in df.columns else "Close",
-        "Volume": "Volume",
-    }
-    out: Dict[str, Any] = {}
-    for key, col in cols.items():
-        if col in df.columns:
-            s = df[col]
-            if key != "Volume":
-                s = s.round(4)
-            else:
-                s = s.fillna(0).astype(int)
-            out[key] = s.dropna().to_dict()
-    return out
-
-
-def _compute_indicators(df: pd.DataFrame) -> Dict[str, Any]:
-    """RSI(14), MACD(12,26,9), Bollinger(20,2), Stoch(14,3)."""
-    out: Dict[str, Any] = {}
-    d = df.copy()
-
-    if not _is_df_ok(d):
-        return out
-
-    close = d["Close"]
-
-    # RSI 14
-    try:
-        delta = close.diff()
-        gain = delta.clip(lower=0)
-        loss = (-delta).clip(lower=0)
-        roll = 14
-        avg_gain = gain.rolling(roll, min_periods=roll).mean()
-        avg_loss = loss.rolling(roll, min_periods=roll).mean()
-        rs = avg_gain / (avg_loss.replace(0, np.nan))
-        rsi = 100 - (100 / (1 + rs))
-        rsi = rsi.round(2)
-        out["RSI"] = rsi.dropna().to_dict()
-    except Exception:
-        pass
-
-    # MACD 12/26 + Signal 9
-    try:
-        ema12 = close.ewm(span=12, adjust=False).mean()
-        ema26 = close.ewm(span=26, adjust=False).mean()
-        macd = ema12 - ema26
-        signal = macd.ewm(span=9, adjust=False).mean()
-        hist = macd - signal
-        out["MACD"] = {
-            "macd": macd.round(4).dropna().to_dict(),
-            "signal": signal.round(4).dropna().to_dict(),
-            "hist": hist.round(4).dropna().to_dict(),
-        }
-    except Exception:
-        pass
-
-    # Bollinger 20, 2
-    try:
-        m = close.rolling(20, min_periods=20).mean()
-        s = close.rolling(20, min_periods=20).std(ddof=0)
-        upper = (m + 2 * s).round(4)
-        lower = (m - 2 * s).round(4)
-        mid = m.round(4)
-        out["Bollinger"] = {
-            "upper": upper.dropna().to_dict(),
-            "middle": mid.dropna().to_dict(),
-            "lower": lower.dropna().to_dict(),
-        }
-    except Exception:
-        pass
-
-    # Stochastic 14,3
-    try:
-        low14 = d["Low"].rolling(14, min_periods=14).min()
-        high14 = d["High"].rolling(14, min_periods=14).max()
-        stoch_k = ((close - low14) / (high14 - low14) * 100).rolling(3, min_periods=3).mean()
-        stoch_d = stoch_k.rolling(3, min_periods=3).mean()
-        out["Stoch"] = {
-            "%K": stoch_k.round(2).dropna().to_dict(),
-            "%D": stoch_d.round(2).dropna().to_dict(),
-        }
-    except Exception:
-        pass
-
-    return out
-
-
-def _period_fallbacks(period: str) -> list[str]:
-    """
-    Alternative Perioden, falls Yahoo für den gewünschten Zeitraum leer liefert.
-    """
-    mapping = {
-        "5d": ["10d", "14d", "1mo"],
-        "1mo": ["30d", "45d", "2mo"],
-        "3mo": ["90d", "120d", "6mo"],
-        "6mo": ["180d", "365d", "1y"],
-        "1y": ["365d", "18mo", "2y"],
-        "2y": ["730d", "3y"],
-    }
-    return mapping.get(period, ["30d", "90d", "180d"])
-
-
-def fetch_with_fallbacks(ticker: str, period: str, interval: str) -> pd.DataFrame:
-    """
-    Robust: download -> history -> alternative Perioden.
-    """
-    # 1) download
-    df = yf.download(
-        tickers=ticker,
-        period=period,
-        interval=interval,
-        auto_adjust=False,
-        progress=False,
-        threads=False,
-    )
-    if _is_df_ok(df):
-        return df
-
-    # 2) history
-    try:
-        t = yf.Ticker(ticker)
-        df = t.history(period=period, interval=interval, auto_adjust=False)
-        if _is_df_ok(df):
-            return df
-    except Exception:
-        pass
-
-    # 3) alternative Perioden probieren
-    for alt in _period_fallbacks(period):
-        try:
-            df = yf.download(
-                tickers=ticker,
-                period=alt,
-                interval=interval,
-                auto_adjust=False,
-                progress=False,
-                threads=False,
-            )
-            if _is_df_ok(df):
-                return df
-        except Exception:
-            continue
-
-    return pd.DataFrame()  # leer => kein Erfolg
-
-
-# ---------------------------
-# Endpoints
-# ---------------------------
 @app.get("/", response_class=JSONResponse)
 def root():
-    return {"status": "ok", "ts": datetime.utcnow().isoformat() + "Z"}
+    # leichte Health-Response, damit Render beim Aufwecken schnell was hat
+    return {"status": "ok", "ts": datetime.utcnow().isoformat()}
 
 
-@app.get("/healthz", response_class=JSONResponse)
-def healthz():
-    return {"status": "ok"}
+# -------------------------------------------------
+# Hilfen
+# -------------------------------------------------
+def _to_records(df: pd.DataFrame) -> dict:
+    """
+    Konvertiert OHLCV + Indikatoren in einfaches, JSON-serialisierbares Dict.
+    Index -> ISO-Strings.
+    """
+    out = {}
+    if df is None or df.empty:
+        return out
+
+    # Zeitachse
+    out["index"] = [pd.Timestamp(x).isoformat() for x in df.index.to_pydatetime()]
+
+    # OHLCV – nur vorhandene Spalten mitnehmen
+    for col in ["Open", "High", "Low", "Close", "Adj Close", "Volume"]:
+        if col in df.columns:
+            # floats -> normal rounden (2 Nachkommastellen reichen)
+            out[col] = [None if pd.isna(v) else float(round(v, 6)) for v in df[col].tolist()]
+
+    # Indikatoren, wenn vorhanden
+    for col in ["RSI", "MACD", "MACD_signal", "Bollinger_upper", "Bollinger_lower", "Stoch_K", "Stoch_D"]:
+        if col in df.columns:
+            out[col] = [None if pd.isna(v) else float(round(v, 6)) for v in df[col].tolist()]
+
+    return out
 
 
+def _calc_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Ein paar robuste, rechenleichte Indikatoren.
+    Keine externen Libs, nur pandas/numpy.
+    """
+    if df is None or df.empty or "Close" not in df.columns:
+        return df
+
+    close = df["Close"].astype(float)
+
+    # RSI(14)
+    window = 14
+    delta = close.diff()
+    up = np.where(delta > 0, delta, 0.0)
+    down = np.where(delta < 0, -delta, 0.0)
+    roll_up = pd.Series(up, index=close.index).rolling(window).mean()
+    roll_down = pd.Series(down, index=close.index).rolling(window).mean()
+    rs = roll_up / (roll_down.replace(0, np.nan))
+    rsi = 100 - (100 / (1 + rs))
+    df["RSI"] = rsi
+
+    # MACD(12,26,9)
+    ema12 = close.ewm(span=12, adjust=False).mean()
+    ema26 = close.ewm(span=26, adjust=False).mean()
+    macd = ema12 - ema26
+    macd_signal = macd.ewm(span=9, adjust=False).mean()
+    df["MACD"] = macd
+    df["MACD_signal"] = macd_signal
+
+    # Bollinger(20,2)
+    ma20 = close.rolling(20).mean()
+    std20 = close.rolling(20).std()
+    df["Bollinger_upper"] = ma20 + 2 * std20
+    df["Bollinger_lower"] = ma20 - 2 * std20
+
+    # Stochastic(14)
+    low14 = df["Low"].rolling(14).min() if "Low" in df.columns else close.rolling(14).min()
+    high14 = df["High"].rolling(14).max() if "High" in df.columns else close.rolling(14).max()
+    stoch_k = 100 * (close - low14) / (high14 - low14)
+    stoch_d = stoch_k.rolling(3).mean()
+    df["Stoch_K"] = stoch_k
+    df["Stoch_D"] = stoch_d
+
+    return df
+
+
+def _download_tolerant(ticker: str, period: str, interval: str, max_retries: int = 2) -> pd.DataFrame:
+    """
+    Ein Download-Versuch mit kleinen Wartezeiten und 1–2 automatischen Retries.
+    """
+    for attempt in range(max_retries + 1):
+        try:
+            df = yf.download(ticker, period=period, interval=interval, **YF_KWARGS)
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                # Falls yfinance Multiindex OHLCV liefert
+                if isinstance(df.columns, pd.MultiIndex):
+                    df.columns = [' '.join(col).strip() for col in df.columns.values]
+                    # Standardisiere Spaltennamen auf typische Bezeichner
+                    rename_map = {
+                        "Open": "Open", "High": "High", "Low": "Low", "Close": "Close",
+                        "Adj Close": "Adj Close", "Volume": "Volume"
+                    }
+                    # falls die Namen in der Form 'Close' oder 'Close close' usw. vorliegen
+                    for col in list(df.columns):
+                        base = col.split()[-1].capitalize()
+                        if base in rename_map:
+                            df.rename(columns={col: rename_map[base]}, inplace=True)
+
+                return df
+        except Exception:
+            pass
+        time.sleep(1.0 + attempt * 1.0)
+    return pd.DataFrame()
+
+
+def fetch_data_resilient(ticker: str, requested_period: str, requested_interval: str) -> Tuple[pd.DataFrame, Tuple[str, str]]:
+    """
+    Versuche zuerst mit der gewünschten Kombi, dann mit Fallback-Kombis aus RANGE_MATRIX.
+    """
+    tried = set()
+    combos = [(requested_period, requested_interval)] + list(RANGE_MATRIX)
+    for period, interval in combos:
+        key = f"{period}|{interval}"
+        if key in tried:
+            continue
+        tried.add(key)
+
+        df = _download_tolerant(ticker, period=period, interval=interval, max_retries=2)
+        if not df.empty:
+            # Index säubern
+            df = df.sort_index()
+            if not isinstance(df.index, pd.DatetimeIndex):
+                df.index = pd.to_datetime(df.index, errors="coerce")
+                df = df.dropna(axis=0, subset=[df.index.name])
+
+            # Indikatoren
+            df = _calc_indicators(df)
+            return df, (period, interval)
+
+    return pd.DataFrame(), ("", "")
+
+
+# -------------------------------------------------
+# API
+# -------------------------------------------------
 @app.get("/api/stock", response_class=JSONResponse)
-def api_stock(
-    ticker: str = Query(..., description="Symbol, z. B. AAPL"),
-    period: str = Query("1mo", description="z. B. 5d, 1mo, 3mo, 6mo, 1y"),
-    interval: str = Query("1d", description="z. B. 1d, 1h, 30m, 15m"),
-    indicators: bool = Query(True, description="RSI/MACD/Bollinger/Stoch mitliefern"),
-) -> Any:
-    try:
-        df = fetch_with_fallbacks(ticker, period, interval)
-        if not _is_df_ok(df):
-            return JSONResponse({"error": "Keine Daten gefunden", "ticker": ticker})
+def get_stock(
+    ticker: str = Query(..., description="z.B. AAPL"),
+    period: str = Query("1mo", description="z.B. 30d, 1mo, 3mo, 6mo, 1y"),
+    interval: str = Query("1d", description="z.B. 1d, 1h, 1wk"),
+):
+    ticker = ticker.upper().strip()
 
-        df = _clean_index(df)
+    df, used = fetch_data_resilient(ticker, period, interval)
+    if df.empty:
+        return JSONResponse({"error": "Keine Daten gefunden", "ticker": ticker}, status_code=502)
 
-        payload: Dict[str, Any] = {
-            "meta": {
-                "ticker": ticker.upper(),
-                "period": period,
-                "interval": interval,
-            },
-            "ohlc": _as_ohlc_json(df),
-        }
-
-        if indicators:
-            payload["indicators"] = _compute_indicators(df)
-
-        return payload
-
-    except Exception as e:
-        return JSONResponse({"error": str(e), "ticker": ticker})
+    payload = {
+        "ticker": ticker,
+        "used_period": used[0],
+        "used_interval": used[1],
+        "data": _to_records(df),
+    }
+    return JSONResponse(payload)
