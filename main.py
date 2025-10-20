@@ -1,208 +1,212 @@
-from fastapi import FastAPI, Request, Query
+from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from datetime import datetime, timedelta
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, List, Tuple
+import io
 import pandas as pd
 import numpy as np
 import yfinance as yf
 import requests
-from pandas_datareader import data as pdr
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
-# --------------------------
-# FastAPI App + CORS
-# --------------------------
-app = FastAPI(title="Trading Backend")
-
-# ➜ Trage hier deine Frontend-URL(s) ein; auf Render ist das z. B.:
-# https://trading-frontend-coje.onrender.com
-ALLOWED_ORIGINS = [
+# -----------------------------
+# Render/CORS: Frontend erlauben
+# -----------------------------
+FRONTEND_ORIGINS = [
     "https://trading-frontend-coje.onrender.com",
-    # Optional (eigene Domain später):
-    # "https://tool.market-vision-pro.com",
+    "http://localhost:5173",
 ]
+app = FastAPI(title="Trading Backend (robust)")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS + ["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=FRONTEND_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# --------------------------
-# Kleiner In-Memory-Cache (5 Min)
-# --------------------------
-CACHE: Dict[Tuple[str, Optional[str], Optional[str]], Dict[str, Any]] = {}
-CACHE_TTL_SECONDS = 300  # 5 Minuten
-
-def _cache_get(key):
-    item = CACHE.get(key)
-    if not item:
-        return None
-    if datetime.utcnow() > item["exp"]:
-        CACHE.pop(key, None)
-        return None
-    return item["val"]
-
-def _cache_set(key, val):
-    CACHE[key] = {"val": val, "exp": datetime.utcnow() + timedelta(seconds=CACHE_TTL_SECONDS)}
-
-# --------------------------
-# Utils
-# --------------------------
+# -----------------------------
+# HTTP Session mit Retries + UA
+# -----------------------------
 def make_session() -> requests.Session:
-    """Requests-Session mit UA, damit Yahoo weniger zickt."""
     s = requests.Session()
+    retries = Retry(
+        total=3,                # 3 Versuche
+        backoff_factor=0.6,     # 0.6s, 1.2s, 2.4s …
+        status_forcelist=[429,500,502,503,504],
+        allowed_methods=["GET", "HEAD"],
+        raise_on_status=False,
+    )
+    s.mount("https://", HTTPAdapter(max_retries=retries))
+    s.mount("http://", HTTPAdapter(max_retries=retries))
     s.headers.update({
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                      "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36"
     })
     return s
 
-def df_to_payload(df: pd.DataFrame) -> Dict[str, Any]:
-    """Standardisiertes JSON für Frontend. Index als ISO-String."""
-    out = {}
-    # Index vereinheitlichen
-    if not isinstance(df.index, pd.DatetimeIndex):
-        # Stooq kommt oft mit Date-Index; konvertieren
-        df.index = pd.to_datetime(df.index)
+SESSION = make_session()
 
-    out["index"] = [d.strftime("%Y-%m-%d %H:%M:%S") for d in df.index]
+# -----------------------------
+# Mini In-Memory Cache (10 min)
+# -----------------------------
+CACHE_TTL = 600  # Sekunden
+CACHE: Dict[str, Dict[str, Any]] = {}  # key -> {ts,data}
 
-    # Normale OHLCV Felder, nur wenn vorhanden
-    for col in ["Open", "High", "Low", "Close", "Adj Close", "Volume"]:
-        if col in df.columns:
-            # NaN → None, damit JSON sauber ist
-            vals = df[col].replace({np.nan: None}).tolist()
-            out[col] = vals
+def cache_key(ticker: str, period: str|None, interval: str|None) -> str:
+    return f"{ticker.upper()}|{period or '-'}|{interval or '-'}"
 
-    # Ein paar leichte Indikatoren (optional, falls Frontend sie anzeigt)
-    close = df["Close"] if "Close" in df.columns else None
-    if close is not None:
-        try:
-            sma20 = close.rolling(20).mean().replace({np.nan: None}).tolist()
-            sma50 = close.rolling(50).mean().replace({np.nan: None}).tolist()
-            out["SMA20"] = sma20
-            out["SMA50"] = sma50
-        except Exception:
-            pass
+def cache_get(key: str):
+    hit = CACHE.get(key)
+    if not hit: return None
+    if (datetime.utcnow() - hit["ts"]).total_seconds() > CACHE_TTL:
+        CACHE.pop(key, None); return None
+    return hit["data"]
 
-    return out
+def cache_put(key: str, data: Dict[str, Any]):
+    CACHE[key] = {"ts": datetime.utcnow(), "data": data}
 
-# --------------------------
+# -----------------------------
+# Utils
+# -----------------------------
+def period_to_days(p: str) -> int:
+    # grobe Umrechnung für Filter
+    table = {"1mo":31, "3mo":93, "6mo":186, "1y":365, "2y":730, "5y":1825}
+    return table.get(p, 365)
+
+def to_payload(df: pd.DataFrame) -> Dict[str, Any]:
+    df = df.copy()
+    df.index = pd.to_datetime(df.index)
+    df = df.sort_index()
+    return {
+        "index": [d.strftime("%Y-%m-%d %H:%M:%S") for d in df.index],
+        "Open":  [float(x) for x in df["Open"].astype(float).tolist()],
+        "High":  [float(x) for x in df["High"].astype(float).tolist()],
+        "Low":   [float(x) for x in df["Low"].astype(float).tolist()],
+        "Close": [float(x) for x in df["Close"].astype(float).tolist()],
+    }
+
+# -----------------------------
 # Datenquellen
-# --------------------------
-def fetch_stooq_daily(ticker: str) -> Optional[pd.DataFrame]:
-    """Stooq liefert Daily-Daten. Wir versuchen Ticker & Ticker.US."""
-    for sym in [ticker, f"{ticker}.US"]:
+# -----------------------------
+def fetch_from_stooq_daily(ticker: str) -> pd.DataFrame:
+    """
+    Stooq liefert stabile Daily-Daten als CSV.
+    """
+    url = f"https://stooq.com/q/d/l/?s={ticker.lower()}&i=d"
+    r = SESSION.get(url, timeout=15)
+    if r.status_code != 200 or "Date,Open,High,Low,Close,Volume" not in r.text:
+        raise RuntimeError("stooq empty or unexpected format")
+    df = pd.read_csv(io.StringIO(r.text))
+    df["Date"] = pd.to_datetime(df["Date"])
+    df.set_index("Date", inplace=True)
+    df = df.rename(columns=str.strip)[["Open","High","Low","Close"]].dropna()
+    return df
+
+def fetch_from_yfinance_with_fallbacks(ticker: str,
+                                       prefer_period: str|None,
+                                       prefer_interval: str|None) -> Tuple[pd.DataFrame, str, str, List[Tuple[str,str]]]:
+    """
+    Versucht mehrere (period, interval)-Kombis; gibt verwendete Kombi + Liste der Versuche zurück.
+    """
+    tried: List[Tuple[str,str]] = []
+    combos: List[Tuple[str,str]] = []
+
+    if prefer_period and prefer_interval:
+        combos.append((prefer_period, prefer_interval))
+
+    # robuste Daily-Kombis (intraday ist auf Render/Yahoo oft flaky)
+    for p in ["1mo","3mo","6mo","1y","2y"]:
+        combos.append((p, "1d"))
+
+    seen = set()
+    combos = [c for c in combos if not (c in seen or seen.add(c))]
+
+    last_err = None
+    for p,i in combos:
+        tried.append((p,i))
         try:
-            df = pdr.DataReader(sym, "stooq")
-            if df is not None and not df.empty:
-                df = df.sort_index()  # Stooq kommt oft absteigend
-                # Spaltennamen harmonisieren
-                for alt, std in [("Open", "Open"), ("High", "High"), ("Low", "Low"),
-                                 ("Close", "Close"), ("Volume", "Volume")]:
-                    if alt not in df.columns and std in df.columns:
-                        pass  # ist ok
-                return df
-        except Exception:
+            df = yf.download(
+                ticker, period=p, interval=i,
+                progress=False, auto_adjust=False, prepost=False, threads=False
+            )
+            # yfinance gibt bei manchen Fehlern ein DataFrame mit Spalten aber ohne Zeilen
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                cols = [c for c in ["Open","High","Low","Close"] if c in df.columns]
+                if len(cols) == 4:
+                    out = df[cols].dropna()
+                    if not out.empty:
+                        return out, p, i, tried
+        except Exception as e:
+            last_err = e
             continue
-    return None
+    if last_err:
+        raise last_err
+    raise RuntimeError("yfinance returned empty for all combos")
 
-def fetch_yfinance(ticker: str, period: str, interval: str, session: requests.Session) -> Optional[pd.DataFrame]:
-    """Ein Aufruf an Yahoo mit Session/UA; None bei leeren Frames."""
-    try:
-        df = yf.download(
-            tickers=ticker,
-            period=period,
-            interval=interval,
-            progress=False,
-            session=session,
-            auto_adjust=False,
-            threads=False,
-        )
-        if df is not None and not df.empty:
-            # YF liefert MultiIndex in manchen Intervallen; flachziehen
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = [" ".join(col).strip() for col in df.columns.values]
-            # Einheitliche Namen soweit möglich
-            for col in ["Open","High","Low","Close","Adj Close","Volume"]:
-                if col not in df.columns:
-                    # Versuche Varianten zu mappen (z.B. 'Adj Close' fehlt manchmal)
-                    pass
-            return df
-    except Exception:
-        return None
-    return None
-
-def fetch_with_fallbacks(ticker: str, req_period: Optional[str], req_interval: Optional[str]) -> Dict[str, Any]:
+# -----------------------------
+# Orchestrierung: Quelle wählen
+# -----------------------------
+def obtain_data(ticker: str, period: str|None, interval: str|None) -> Dict[str, Any]:
     """
-    1) Stooq (Daily) zuerst.
-    2) Falls leer, Yahoo mit mehreren Kombis oder der gewünschten Kombi.
+    1) Für Daily zuerst Stooq (stabil, schnell).
+    2) Falls (interval != 1d) oder Stooq leer: auf yfinance mit Fallbacks.
+    3) Ergebnis inkl. Metadaten (source, used_period, used_interval).
     """
-    # 1) Stooq (stabil, daily)
-    df = fetch_stooq_daily(ticker)
-    if df is not None and not df.empty:
-        payload = df_to_payload(df)
-        payload.update({"used_source": "stooq", "used_period": "1y", "used_interval": "1d"})
-        return payload
+    meta: Dict[str, Any] = {
+        "source": None, "used_period": period, "used_interval": interval, "ts": datetime.utcnow().isoformat()
+    }
 
-    # 2) Yahoo-Fallbacks
-    session = make_session()
+    # Versuch 1: Stooq (nur Daily)
+    if interval in (None, "", "1d"):
+        try:
+            df = fetch_from_stooq_daily(ticker)
+            if period:
+                days = period_to_days(period)
+                start = datetime.utcnow() - timedelta(days=days)
+                df = df[df.index >= pd.Timestamp(start.date())]
+            if not df.empty:
+                meta["source"] = "stooq"
+                meta["used_interval"] = "1d"
+                if period is None:
+                    meta["used_period"] = "1y"  # grobe Angabe
+                return {"payload": to_payload(df), "meta": meta}
+        except Exception:
+            pass  # weiter zu yfinance
 
-    # Wenn der Client period/interval mitgibt, probieren wir das zuerst…
-    combos = []
-    if req_period or req_interval:
-        combos.append((req_period or "1y", req_interval or "1d"))
+    # Versuch 2: yfinance (mit Fallbacks)
+    df, used_p, used_i, tried = fetch_from_yfinance_with_fallbacks(ticker, period, interval)
+    meta.update({"source": "yfinance", "used_period": used_p, "used_interval": used_i, "tried": tried})
+    return {"payload": to_payload(df), "meta": meta}
 
-    # …danach bewährte Kombinationen
-    combos += [
-        ("1mo", "1d"),
-        ("3mo", "1d"),
-        ("6mo", "1d"),
-        ("1y", "1d"),
-        ("5d", "1h"),  # etwas intraday
-        ("1d", "15m"),
-    ]
-
-    tried = []
-    for period, interval in combos:
-        period = period or "1y"
-        interval = interval or "1d"
-        tried.append((period, interval))
-        df = fetch_yfinance(ticker, period, interval, session=session)
-        if df is not None and not df.empty:
-            payload = df_to_payload(df)
-            payload.update({"used_source": "yfinance", "used_period": period, "used_interval": interval})
-            return payload
-
-    return {"error": "Keine Daten gefunden", "ticker": ticker, "tried": tried}
-
-# --------------------------
-# Routes
-# --------------------------
+# -----------------------------
+# FastAPI Endpoints
+# -----------------------------
 @app.get("/", response_class=JSONResponse)
 def root():
     return {"status": "ok", "ts": datetime.utcnow().isoformat()}
 
 @app.get("/api/stock", response_class=JSONResponse)
 def api_stock(
-    request: Request,
-    ticker: str = Query(...),
-    period: Optional[str] = Query(None),
-    interval: Optional[str] = Query(None),
+    ticker: str = Query(..., description="z.B. AAPL"),
+    period: str | None = Query(None, description="z.B. 1mo, 3mo, 6mo, 1y …"),
+    interval: str | None = Query(None, description="z.B. 1d (empfohlen)"),
 ):
-    key = (ticker.upper(), period, interval)
-
-    cached = _cache_get(key)
-    if cached is not None:
+    key = cache_key(ticker, period, interval)
+    cached = cache_get(key)
+    if cached:
         return cached
 
-    data = fetch_with_fallbacks(ticker.upper(), period, interval)
-    if "error" in data:
-        # Kein 500, sondern 200 mit Fehlertext → Frontend kann sinnvoll reagieren
-        return JSONResponse(data)
-
-    _cache_set(key, data)
-    return data
+    try:
+        result = obtain_data(ticker.strip(), period, interval)
+        data = {"ok": True, **result}
+        cache_put(key, data)
+        return data
+    except Exception as e:
+        # saubere Fehlermeldung zurückgeben
+        return JSONResponse(
+            {"ok": False, "error": str(e), "ticker": ticker, "used_period": period, "used_interval": interval},
+            status_code=502
+        )
