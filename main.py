@@ -1,235 +1,176 @@
-from fastapi import FastAPI, Query, Request
+from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from typing import Dict, Any, Tuple, Optional
+from datetime import datetime
+import time
+
 import yfinance as yf
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta, timezone
-import time
-import logging
-import threading
-import requests
 
-# -------- Logging ----------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
-log = logging.getLogger("backend")
-
-# -------- App + CORS -------
 app = FastAPI(title="Trading Backend")
 
+# CORS – dein Frontend erlauben
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "https://trading-frontend-coje.onrender.com",
-        "https://tool.market-vision-pro.com",
         "http://localhost:5173",
-        "http://localhost:3000",
+        "http://localhost:5174",
     ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# -------- HTTP Session mit UA (gegen leere Yahoo-Frames) --------
-SESSION = requests.Session()
-SESSION.headers.update({
-    "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/127.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-})
+# -------- Mini-Cache (5 Minuten) --------
+CACHE_TTL = 300  # Sekunden
+CACHE: Dict[str, Tuple[float, dict]] = {}
 
-# -------- Mini-Cache (RAM) --------
-_cache = {}              # key: (ticker, period, interval) -> (ts, payload)
-CACHE_TTL = 60           # Sekunden
+def _ck(ticker: str, period: str, interval: str) -> str:
+    return f"{ticker}:{period}:{interval}"
 
-def _cache_get(key):
-    item = _cache.get(key)
-    if not item:
+def _get_cache(k: str) -> Optional[dict]:
+    it = CACHE.get(k)
+    if not it:
         return None
-    ts, payload = item
-    if time.time() - ts > CACHE_TTL:
-        return None
-    return payload
+    ts, payload = it
+    if time.time() - ts < CACHE_TTL:
+        return payload
+    CACHE.pop(k, None)
+    return None
 
-def _cache_set(key, payload):
-    _cache[key] = (time.time(), payload)
+def _set_cache(k: str, payload: dict) -> None:
+    CACHE[k] = (time.time(), payload)
 
-# -------- robuste Datenbeschaffung --------
-# Kombis in der Reihenfolge, die in der Praxis am häufigsten erfolgreich sind
-CANDIDATES = [
-    ("1mo", "1d"),
-    ("30d", "1d"),
-    ("3mo", "1d"),
-    ("6mo", "1d"),
-    ("1y", "1d"),
-    ("60d", "1h"),
-    ("5d", "15m"),
-]
+# -------- Indikatoren --------
+def _add_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    close = df["Close"].astype(float)
 
-def _download_yf(ticker: str, period: str, interval: str) -> pd.DataFrame:
-    """
-    Erst Ticker.history (nutzt Session sicher), dann fallback auf yf.download.
-    Beide Wege mit derselben Session+UA.
-    """
-    try:
-        t = yf.Ticker(ticker, session=SESSION)
-        df = t.history(period=period, interval=interval, auto_adjust=False)
-        if isinstance(df, pd.DataFrame) and not df.empty:
-            return df
-    except Exception as e:
-        log.warning(f"Ticker.history failed: {e}")
+    # RSI(14)
+    delta = close.diff()
+    up = delta.clip(lower=0)
+    down = -delta.clip(upper=0)
+    r_up = up.rolling(14, min_periods=14).mean()
+    r_dn = down.rolling(14, min_periods=14).mean().replace(0, np.nan)
+    rs = r_up / r_dn
+    df["RSI"] = 100 - 100 / (1 + rs)
 
-    # Fallback: yf.download (neuere yfinance akzeptiert session=)
-    try:
-        df = yf.download(
-            tickers=ticker,
-            period=period,
-            interval=interval,
-            auto_adjust=False,
-            progress=False,
-            session=SESSION
-        )
-        if isinstance(df, pd.DataFrame) and not df.empty:
-            return df
-    except Exception as e:
-        log.warning(f"yf.download failed: {e}")
-
-    return pd.DataFrame()
-
-def _ensure_df(df: pd.DataFrame) -> pd.DataFrame:
-    # Spalten harmonisieren
-    if not isinstance(df, pd.DataFrame) or df.empty:
-        return pd.DataFrame()
-    cols = {c.lower(): c for c in df.columns}
-    want = ["Open", "High", "Low", "Close", "Adj Close", "Volume"]
-    out = {}
-    for name in want:
-        key = name.lower()
-        if key in cols:
-            out[name] = df[cols[key]]
-    dfo = pd.DataFrame(out)
-    if "Datetime" in dfo.columns:
-        dfo.set_index("Datetime", inplace=True)
-    if not isinstance(dfo.index, pd.DatetimeIndex):
-        if "Date" in df.columns:
-            dfo.index = pd.to_datetime(df["Date"])
-        else:
-            dfo.index = pd.to_datetime(df.index)
-    dfo.index = dfo.index.tz_localize(None) if dfo.index.tz is not None else dfo.index
-    return dfo
-
-def _calc_indicators(dfo: pd.DataFrame) -> pd.DataFrame:
-    if dfo.empty:
-        return dfo
-    # RSI (14)
-    delta = dfo["Close"].diff()
-    up, down = delta.clip(lower=0), -delta.clip(upper=0)
-    roll = 14
-    roll_up = up.rolling(roll, min_periods=roll).mean()
-    roll_down = down.rolling(roll, min_periods=roll).mean()
-    rs = roll_up / (roll_down + 1e-12)
-    dfo["RSI"] = 100 - (100 / (1 + rs))
-
-    # MACD
-    ema12 = dfo["Close"].ewm(span=12, adjust=False).mean()
-    ema26 = dfo["Close"].ewm(span=26, adjust=False).mean()
+    # MACD(12,26,9)
+    ema12 = close.ewm(span=12, adjust=False).mean()
+    ema26 = close.ewm(span=26, adjust=False).mean()
     macd = ema12 - ema26
     signal = macd.ewm(span=9, adjust=False).mean()
-    dfo["MACD"] = macd
-    dfo["MACD_Signal"] = signal
-    dfo["MACD_Hist"] = macd - signal
+    df["MACD"] = macd
+    df["MACD_signal"] = signal
 
-    # Bollinger (20, 2)
-    ma20 = dfo["Close"].rolling(20, min_periods=20).mean()
-    std20 = dfo["Close"].rolling(20, min_periods=20).std(ddof=0)
-    dfo["BB_Middle"] = ma20
-    dfo["BB_Upper"] = ma20 + 2 * std20
-    dfo["BB_Lower"] = ma20 - 2 * std20
+    # Bollinger(20, 2σ)
+    sma20 = close.rolling(20, min_periods=20).mean()
+    std20 = close.rolling(20, min_periods=20).std()
+    df["BB_upper"] = sma20 + 2 * std20
+    df["BB_lower"] = sma20 - 2 * std20
 
-    # Stochastic (14)
-    low14 = dfo["Low"].rolling(14, min_periods=14).min()
-    high14 = dfo["High"].rolling(14, min_periods=14).max()
-    stoch_k = 100 * (dfo["Close"] - low14) / (high14 - low14 + 1e-12)
-    dfo["Stoch_K"] = stoch_k
-    dfo["Stoch_D"] = stoch_k.rolling(3, min_periods=3).mean()
-    return dfo
+    # Stochastic(14, 3)
+    low14 = df["Low"].rolling(14, min_periods=14).min()
+    high14 = df["High"].rolling(14, min_periods=14).max()
+    stoch_k = 100 * (close - low14) / (high14 - low14)
+    df["Stoch_K"] = stoch_k
+    df["Stoch_D"] = stoch_k.rolling(3, min_periods=3).mean()
 
-def fetch_any(ticker: str, period: str | None, interval: str | None):
-    """
-    Holt Daten robust:
-    - benutzt gewünschte Kombi, wenn gesetzt,
-    - sonst probiert mehrere Kandidaten,
-    - mit Retries + Delay,
-    - gibt außerdem used_period/used_interval zurück.
-    """
-    tried = []
-    combos = [(period, interval)] if period and interval else CANDIDATES
+    return df
 
-    for per, inv in combos:
-        if not per or not inv:
-            continue
-        tried.append((per, inv))
+def _download_once(ticker: str, period: str, interval: str) -> Optional[dict]:
+    try:
+        df = yf.download(
+            ticker,
+            period=period,
+            interval=interval,
+            auto_adjust=True,
+            progress=False,
+            threads=True,
+        )
+        if df is None or df.empty:
+            return None
 
-        # Cache?
-        key = (ticker.upper(), per, inv)
-        cached = _cache_get(key)
-        if cached:
-            return cached | {"used_period": per, "used_interval": inv, "from_cache": True}
+        df = df.reset_index()
+        # Datumsspalte vereinheitlichen
+        if "Date" in df.columns:
+            df.rename(columns={"Date": "datetime"}, inplace=True)
+        elif "Datetime" in df.columns:
+            df.rename(columns={"Datetime": "datetime"}, inplace=True)
+        else:
+            df.rename(columns={df.columns[0]: "datetime"}, inplace=True)
 
-        # 2–3 Retries gegen leere Frames
-        for attempt in range(3):
-            df = _download_yf(ticker, per, inv)
-            dfo = _ensure_df(df)
-            if not dfo.empty and {"Open","High","Low","Close"}.issubset(dfo.columns):
-                dfo = _calc_indicators(dfo)
-                payload = {
-                    "index": [ts.strftime("%Y-%m-%d %H:%M:%S") for ts in dfo.index],
-                    "Open": dfo["Open"].round(4).fillna(None).tolist(),
-                    "High": dfo["High"].round(4).fillna(None).tolist(),
-                    "Low": dfo["Low"].round(4).fillna(None).tolist(),
-                    "Close": dfo["Close"].round(4).fillna(None).tolist(),
-                    "Adj Close": dfo.get("Adj Close", dfo["Close"]).round(4).fillna(None).tolist(),
-                    "Volume": dfo.get("Volume", pd.Series([None]*len(dfo))).fillna(None).astype(object).tolist(),
-                    "RSI": dfo.get("RSI", pd.Series([None]*len(dfo))).round(2).fillna(None).tolist(),
-                    "MACD": dfo.get("MACD", pd.Series([None]*len(dfo))).round(4).fillna(None).tolist(),
-                    "MACD_Signal": dfo.get("MACD_Signal", pd.Series([None]*len(dfo))).round(4).fillna(None).tolist(),
-                    "MACD_Hist": dfo.get("MACD_Hist", pd.Series([None]*len(dfo))).round(4).fillna(None).tolist(),
-                    "BB_Upper": dfo.get("BB_Upper", pd.Series([None]*len(dfo))).round(4).fillna(None).tolist(),
-                    "BB_Middle": dfo.get("BB_Middle", pd.Series([None]*len(dfo))).round(4).fillna(None).tolist(),
-                    "BB_Lower": dfo.get("BB_Lower", pd.Series([None]*len(dfo))).round(4).fillna(None).tolist(),
-                    "Stoch_K": dfo.get("Stoch_K", pd.Series([None]*len(dfo))).round(2).fillna(None).tolist(),
-                    "Stoch_D": dfo.get("Stoch_D", pd.Series([None]*len(dfo))).round(2).fillna(None).tolist(),
-                }
-                # Cache setzen
-                _cache_set(key, payload)
-                log.info(f"OK {ticker} with {per}/{inv} (attempt {attempt+1}) rows={len(dfo)}")
-                return payload | {"used_period": per, "used_interval": inv, "from_cache": False}
+        # Indikatoren anhängen
+        df = _add_indicators(df)
 
-            time.sleep(0.6)  # kurzer Backoff
+        payload = {
+            "index": df["datetime"].astype(str).tolist(),
+            "Open": df["Open"].round(2).tolist(),
+            "High": df["High"].round(2).tolist(),
+            "Low": df["Low"].round(2).tolist(),
+            "Close": df["Close"].round(2).tolist(),
+            "Volume": df.get("Volume", pd.Series([0]*len(df))).fillna(0).astype(int).tolist(),
+            "RSI": np.nan_to_num(df["RSI"]).round(2).tolist(),
+            "MACD": np.nan_to_num(df["MACD"]).round(4).tolist(),
+            "MACD_signal": np.nan_to_num(df["MACD_signal"]).round(4).tolist(),
+            "BB_upper": np.nan_to_num(df["BB_upper"]).round(2).tolist(),
+            "BB_lower": np.nan_to_num(df["BB_lower"]).round(2).tolist(),
+            "Stoch_K": np.nan_to_num(df["Stoch_K"]).round(2).tolist(),
+            "Stoch_D": np.nan_to_num(df["Stoch_D"]).round(2).tolist(),
+        }
+        return payload
+    except Exception:
+        return None
 
-        log.warning(f"Empty frame for {ticker} with {per}/{inv} after retries")
+def _fallback_plan(req_period: Optional[str], req_interval: Optional[str]):
+    order = []
+    if req_period and req_interval:
+        order.append((req_period, req_interval))
+    if req_period:
+        order.append((req_period, "1d"))
+    # robuste Defaults – erfahrungsgemäß zuverlässig
+    order += [
+        ("3mo", "1d"),
+        ("6mo", "1d"),
+        ("1y", "1d"),
+        ("2y", "1wk"),
+        ("5y", "1wk"),
+        ("10y", "1mo"),
+    ]
+    # deduplizieren
+    seen = set()
+    plan = []
+    for p, i in order:
+        if (p, i) not in seen:
+            plan.append((p, i))
+            seen.add((p, i))
+    return plan
 
-    return {"error": "Keine Daten gefunden", "ticker": ticker, "tried": tried}
-
-# -------- Routes --------
-@app.get("/", response_class=JSONResponse)
+@app.get("/")
 def root():
-    return {"status": "ok", "ts": datetime.now(timezone.utc).isoformat()}
+    return {"status": "ok", "ts": datetime.utcnow().isoformat()}
 
-@app.get("/api/stock", response_class=JSONResponse)
+@app.get("/api/stock")
 def api_stock(
-    ticker: str = Query(..., description="z.B. AAPL"),
-    period: str | None = Query(None, description="z.B. 1mo, 30d, 3mo, 6mo, 1y"),
-    interval: str | None = Query(None, description="z.B. 1d, 1h, 15m")
+    ticker: str,
+    period: Optional[str] = Query(default=None),
+    interval: Optional[str] = Query(default=None),
 ):
-    payload = fetch_any(ticker, period, interval)
-    # Bei Fehler → 404 (damit Frontend sauber reagieren kann)
-    if "error" in payload:
-        return JSONResponse(payload, status_code=404)
-    return payload
+    t = ticker.upper().strip()
+    for p, i in _fallback_plan(period, interval):
+        ck = _ck(t, p, i)
+        cached = _get_cache(ck)
+        if cached:
+            out = dict(cached)
+            out.update({"used_period": p, "used_interval": i, "source": "cache"})
+            return out
+
+        data = _download_once(t, p, i)
+        if data:
+            data.update({"used_period": p, "used_interval": i, "source": "live"})
+            _set_cache(ck, dict(data))
+            return data
+
+    return JSONResponse({"error": "Keine Daten gefunden", "ticker": t}, status_code=404)
