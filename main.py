@@ -1,221 +1,235 @@
-# main.py
-import os
-import time
-from datetime import datetime, timedelta
-from typing import Literal, Optional, Tuple
-
-import pandas as pd
-import numpy as np
-import yfinance as yf
-import requests
-
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+import yfinance as yf
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta, timezone
+import time
+import logging
+import threading
+import requests
 
-# -------------------------------------------------
-# Konfiguration
-# -------------------------------------------------
-FRONTEND_ORIGINS = [
-    "https://trading-frontend-coje.onrender.com",
-    "https://tool.market-vision-pro.com",  # falls du die Domain nutzt
-]
-
-# Stabilere yfinance-Session (User-Agent gegen Blocks)
-_requests_session = requests.Session()
-_requests_session.headers.update({
-    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                  "(KHTML, like Gecko) Chrome/127.0 Safari/537.36"
-})
-
-# yfinance-Defaults
-YF_KWARGS = dict(
-    auto_adjust=True,  # Dividenden/Splits korrigiert – stabilere Charts
-    prepost=False,
-    progress=False,
-    threads=True,
-    session=_requests_session,
+# -------- Logging ----------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
 )
+log = logging.getLogger("backend")
 
-# Unterstützte Kombis – wir probieren diese Reihenfolge nacheinander
-RANGE_MATRIX: Tuple[Tuple[str, str], ...] = (
-    ("30d", "1d"),
-    ("1mo", "1d"),
-    ("3mo", "1d"),
-    ("6mo", "1d"),
-    ("1y", "1d"),
-)
-
-# -------------------------------------------------
-# FastAPI
-# -------------------------------------------------
+# -------- App + CORS -------
 app = FastAPI(title="Trading Backend")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=FRONTEND_ORIGINS + ["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=[
+        "https://trading-frontend-coje.onrender.com",
+        "https://tool.market-vision-pro.com",
+        "http://localhost:5173",
+        "http://localhost:3000",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# -------- HTTP Session mit UA (gegen leere Yahoo-Frames) --------
+SESSION = requests.Session()
+SESSION.headers.update({
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/127.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+})
 
-@app.get("/", response_class=JSONResponse)
-def root():
-    # leichte Health-Response, damit Render beim Aufwecken schnell was hat
-    return {"status": "ok", "ts": datetime.utcnow().isoformat()}
+# -------- Mini-Cache (RAM) --------
+_cache = {}              # key: (ticker, period, interval) -> (ts, payload)
+CACHE_TTL = 60           # Sekunden
 
+def _cache_get(key):
+    item = _cache.get(key)
+    if not item:
+        return None
+    ts, payload = item
+    if time.time() - ts > CACHE_TTL:
+        return None
+    return payload
 
-# -------------------------------------------------
-# Hilfen
-# -------------------------------------------------
-def _to_records(df: pd.DataFrame) -> dict:
+def _cache_set(key, payload):
+    _cache[key] = (time.time(), payload)
+
+# -------- robuste Datenbeschaffung --------
+# Kombis in der Reihenfolge, die in der Praxis am häufigsten erfolgreich sind
+CANDIDATES = [
+    ("1mo", "1d"),
+    ("30d", "1d"),
+    ("3mo", "1d"),
+    ("6mo", "1d"),
+    ("1y", "1d"),
+    ("60d", "1h"),
+    ("5d", "15m"),
+]
+
+def _download_yf(ticker: str, period: str, interval: str) -> pd.DataFrame:
     """
-    Konvertiert OHLCV + Indikatoren in einfaches, JSON-serialisierbares Dict.
-    Index -> ISO-Strings.
+    Erst Ticker.history (nutzt Session sicher), dann fallback auf yf.download.
+    Beide Wege mit derselben Session+UA.
     """
-    out = {}
-    if df is None or df.empty:
-        return out
+    try:
+        t = yf.Ticker(ticker, session=SESSION)
+        df = t.history(period=period, interval=interval, auto_adjust=False)
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            return df
+    except Exception as e:
+        log.warning(f"Ticker.history failed: {e}")
 
-    # Zeitachse
-    out["index"] = [pd.Timestamp(x).isoformat() for x in df.index.to_pydatetime()]
+    # Fallback: yf.download (neuere yfinance akzeptiert session=)
+    try:
+        df = yf.download(
+            tickers=ticker,
+            period=period,
+            interval=interval,
+            auto_adjust=False,
+            progress=False,
+            session=SESSION
+        )
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            return df
+    except Exception as e:
+        log.warning(f"yf.download failed: {e}")
 
-    # OHLCV – nur vorhandene Spalten mitnehmen
-    for col in ["Open", "High", "Low", "Close", "Adj Close", "Volume"]:
-        if col in df.columns:
-            # floats -> normal rounden (2 Nachkommastellen reichen)
-            out[col] = [None if pd.isna(v) else float(round(v, 6)) for v in df[col].tolist()]
-
-    # Indikatoren, wenn vorhanden
-    for col in ["RSI", "MACD", "MACD_signal", "Bollinger_upper", "Bollinger_lower", "Stoch_K", "Stoch_D"]:
-        if col in df.columns:
-            out[col] = [None if pd.isna(v) else float(round(v, 6)) for v in df[col].tolist()]
-
-    return out
-
-
-def _calc_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Ein paar robuste, rechenleichte Indikatoren.
-    Keine externen Libs, nur pandas/numpy.
-    """
-    if df is None or df.empty or "Close" not in df.columns:
-        return df
-
-    close = df["Close"].astype(float)
-
-    # RSI(14)
-    window = 14
-    delta = close.diff()
-    up = np.where(delta > 0, delta, 0.0)
-    down = np.where(delta < 0, -delta, 0.0)
-    roll_up = pd.Series(up, index=close.index).rolling(window).mean()
-    roll_down = pd.Series(down, index=close.index).rolling(window).mean()
-    rs = roll_up / (roll_down.replace(0, np.nan))
-    rsi = 100 - (100 / (1 + rs))
-    df["RSI"] = rsi
-
-    # MACD(12,26,9)
-    ema12 = close.ewm(span=12, adjust=False).mean()
-    ema26 = close.ewm(span=26, adjust=False).mean()
-    macd = ema12 - ema26
-    macd_signal = macd.ewm(span=9, adjust=False).mean()
-    df["MACD"] = macd
-    df["MACD_signal"] = macd_signal
-
-    # Bollinger(20,2)
-    ma20 = close.rolling(20).mean()
-    std20 = close.rolling(20).std()
-    df["Bollinger_upper"] = ma20 + 2 * std20
-    df["Bollinger_lower"] = ma20 - 2 * std20
-
-    # Stochastic(14)
-    low14 = df["Low"].rolling(14).min() if "Low" in df.columns else close.rolling(14).min()
-    high14 = df["High"].rolling(14).max() if "High" in df.columns else close.rolling(14).max()
-    stoch_k = 100 * (close - low14) / (high14 - low14)
-    stoch_d = stoch_k.rolling(3).mean()
-    df["Stoch_K"] = stoch_k
-    df["Stoch_D"] = stoch_d
-
-    return df
-
-
-def _download_tolerant(ticker: str, period: str, interval: str, max_retries: int = 2) -> pd.DataFrame:
-    """
-    Ein Download-Versuch mit kleinen Wartezeiten und 1–2 automatischen Retries.
-    """
-    for attempt in range(max_retries + 1):
-        try:
-            df = yf.download(ticker, period=period, interval=interval, **YF_KWARGS)
-            if isinstance(df, pd.DataFrame) and not df.empty:
-                # Falls yfinance Multiindex OHLCV liefert
-                if isinstance(df.columns, pd.MultiIndex):
-                    df.columns = [' '.join(col).strip() for col in df.columns.values]
-                    # Standardisiere Spaltennamen auf typische Bezeichner
-                    rename_map = {
-                        "Open": "Open", "High": "High", "Low": "Low", "Close": "Close",
-                        "Adj Close": "Adj Close", "Volume": "Volume"
-                    }
-                    # falls die Namen in der Form 'Close' oder 'Close close' usw. vorliegen
-                    for col in list(df.columns):
-                        base = col.split()[-1].capitalize()
-                        if base in rename_map:
-                            df.rename(columns={col: rename_map[base]}, inplace=True)
-
-                return df
-        except Exception:
-            pass
-        time.sleep(1.0 + attempt * 1.0)
     return pd.DataFrame()
 
+def _ensure_df(df: pd.DataFrame) -> pd.DataFrame:
+    # Spalten harmonisieren
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return pd.DataFrame()
+    cols = {c.lower(): c for c in df.columns}
+    want = ["Open", "High", "Low", "Close", "Adj Close", "Volume"]
+    out = {}
+    for name in want:
+        key = name.lower()
+        if key in cols:
+            out[name] = df[cols[key]]
+    dfo = pd.DataFrame(out)
+    if "Datetime" in dfo.columns:
+        dfo.set_index("Datetime", inplace=True)
+    if not isinstance(dfo.index, pd.DatetimeIndex):
+        if "Date" in df.columns:
+            dfo.index = pd.to_datetime(df["Date"])
+        else:
+            dfo.index = pd.to_datetime(df.index)
+    dfo.index = dfo.index.tz_localize(None) if dfo.index.tz is not None else dfo.index
+    return dfo
 
-def fetch_data_resilient(ticker: str, requested_period: str, requested_interval: str) -> Tuple[pd.DataFrame, Tuple[str, str]]:
+def _calc_indicators(dfo: pd.DataFrame) -> pd.DataFrame:
+    if dfo.empty:
+        return dfo
+    # RSI (14)
+    delta = dfo["Close"].diff()
+    up, down = delta.clip(lower=0), -delta.clip(upper=0)
+    roll = 14
+    roll_up = up.rolling(roll, min_periods=roll).mean()
+    roll_down = down.rolling(roll, min_periods=roll).mean()
+    rs = roll_up / (roll_down + 1e-12)
+    dfo["RSI"] = 100 - (100 / (1 + rs))
+
+    # MACD
+    ema12 = dfo["Close"].ewm(span=12, adjust=False).mean()
+    ema26 = dfo["Close"].ewm(span=26, adjust=False).mean()
+    macd = ema12 - ema26
+    signal = macd.ewm(span=9, adjust=False).mean()
+    dfo["MACD"] = macd
+    dfo["MACD_Signal"] = signal
+    dfo["MACD_Hist"] = macd - signal
+
+    # Bollinger (20, 2)
+    ma20 = dfo["Close"].rolling(20, min_periods=20).mean()
+    std20 = dfo["Close"].rolling(20, min_periods=20).std(ddof=0)
+    dfo["BB_Middle"] = ma20
+    dfo["BB_Upper"] = ma20 + 2 * std20
+    dfo["BB_Lower"] = ma20 - 2 * std20
+
+    # Stochastic (14)
+    low14 = dfo["Low"].rolling(14, min_periods=14).min()
+    high14 = dfo["High"].rolling(14, min_periods=14).max()
+    stoch_k = 100 * (dfo["Close"] - low14) / (high14 - low14 + 1e-12)
+    dfo["Stoch_K"] = stoch_k
+    dfo["Stoch_D"] = stoch_k.rolling(3, min_periods=3).mean()
+    return dfo
+
+def fetch_any(ticker: str, period: str | None, interval: str | None):
     """
-    Versuche zuerst mit der gewünschten Kombi, dann mit Fallback-Kombis aus RANGE_MATRIX.
+    Holt Daten robust:
+    - benutzt gewünschte Kombi, wenn gesetzt,
+    - sonst probiert mehrere Kandidaten,
+    - mit Retries + Delay,
+    - gibt außerdem used_period/used_interval zurück.
     """
-    tried = set()
-    combos = [(requested_period, requested_interval)] + list(RANGE_MATRIX)
-    for period, interval in combos:
-        key = f"{period}|{interval}"
-        if key in tried:
+    tried = []
+    combos = [(period, interval)] if period and interval else CANDIDATES
+
+    for per, inv in combos:
+        if not per or not inv:
             continue
-        tried.add(key)
+        tried.append((per, inv))
 
-        df = _download_tolerant(ticker, period=period, interval=interval, max_retries=2)
-        if not df.empty:
-            # Index säubern
-            df = df.sort_index()
-            if not isinstance(df.index, pd.DatetimeIndex):
-                df.index = pd.to_datetime(df.index, errors="coerce")
-                df = df.dropna(axis=0, subset=[df.index.name])
+        # Cache?
+        key = (ticker.upper(), per, inv)
+        cached = _cache_get(key)
+        if cached:
+            return cached | {"used_period": per, "used_interval": inv, "from_cache": True}
 
-            # Indikatoren
-            df = _calc_indicators(df)
-            return df, (period, interval)
+        # 2–3 Retries gegen leere Frames
+        for attempt in range(3):
+            df = _download_yf(ticker, per, inv)
+            dfo = _ensure_df(df)
+            if not dfo.empty and {"Open","High","Low","Close"}.issubset(dfo.columns):
+                dfo = _calc_indicators(dfo)
+                payload = {
+                    "index": [ts.strftime("%Y-%m-%d %H:%M:%S") for ts in dfo.index],
+                    "Open": dfo["Open"].round(4).fillna(None).tolist(),
+                    "High": dfo["High"].round(4).fillna(None).tolist(),
+                    "Low": dfo["Low"].round(4).fillna(None).tolist(),
+                    "Close": dfo["Close"].round(4).fillna(None).tolist(),
+                    "Adj Close": dfo.get("Adj Close", dfo["Close"]).round(4).fillna(None).tolist(),
+                    "Volume": dfo.get("Volume", pd.Series([None]*len(dfo))).fillna(None).astype(object).tolist(),
+                    "RSI": dfo.get("RSI", pd.Series([None]*len(dfo))).round(2).fillna(None).tolist(),
+                    "MACD": dfo.get("MACD", pd.Series([None]*len(dfo))).round(4).fillna(None).tolist(),
+                    "MACD_Signal": dfo.get("MACD_Signal", pd.Series([None]*len(dfo))).round(4).fillna(None).tolist(),
+                    "MACD_Hist": dfo.get("MACD_Hist", pd.Series([None]*len(dfo))).round(4).fillna(None).tolist(),
+                    "BB_Upper": dfo.get("BB_Upper", pd.Series([None]*len(dfo))).round(4).fillna(None).tolist(),
+                    "BB_Middle": dfo.get("BB_Middle", pd.Series([None]*len(dfo))).round(4).fillna(None).tolist(),
+                    "BB_Lower": dfo.get("BB_Lower", pd.Series([None]*len(dfo))).round(4).fillna(None).tolist(),
+                    "Stoch_K": dfo.get("Stoch_K", pd.Series([None]*len(dfo))).round(2).fillna(None).tolist(),
+                    "Stoch_D": dfo.get("Stoch_D", pd.Series([None]*len(dfo))).round(2).fillna(None).tolist(),
+                }
+                # Cache setzen
+                _cache_set(key, payload)
+                log.info(f"OK {ticker} with {per}/{inv} (attempt {attempt+1}) rows={len(dfo)}")
+                return payload | {"used_period": per, "used_interval": inv, "from_cache": False}
 
-    return pd.DataFrame(), ("", "")
+            time.sleep(0.6)  # kurzer Backoff
 
+        log.warning(f"Empty frame for {ticker} with {per}/{inv} after retries")
 
-# -------------------------------------------------
-# API
-# -------------------------------------------------
+    return {"error": "Keine Daten gefunden", "ticker": ticker, "tried": tried}
+
+# -------- Routes --------
+@app.get("/", response_class=JSONResponse)
+def root():
+    return {"status": "ok", "ts": datetime.now(timezone.utc).isoformat()}
+
 @app.get("/api/stock", response_class=JSONResponse)
-def get_stock(
+def api_stock(
     ticker: str = Query(..., description="z.B. AAPL"),
-    period: str = Query("1mo", description="z.B. 30d, 1mo, 3mo, 6mo, 1y"),
-    interval: str = Query("1d", description="z.B. 1d, 1h, 1wk"),
+    period: str | None = Query(None, description="z.B. 1mo, 30d, 3mo, 6mo, 1y"),
+    interval: str | None = Query(None, description="z.B. 1d, 1h, 15m")
 ):
-    ticker = ticker.upper().strip()
-
-    df, used = fetch_data_resilient(ticker, period, interval)
-    if df.empty:
-        return JSONResponse({"error": "Keine Daten gefunden", "ticker": ticker}, status_code=502)
-
-    payload = {
-        "ticker": ticker,
-        "used_period": used[0],
-        "used_interval": used[1],
-        "data": _to_records(df),
-    }
-    return JSONResponse(payload)
+    payload = fetch_any(ticker, period, interval)
+    # Bei Fehler → 404 (damit Frontend sauber reagieren kann)
+    if "error" in payload:
+        return JSONResponse(payload, status_code=404)
+    return payload
