@@ -11,3 +11,5 @@ passlib[bcrypt]==1.7.4
 python-multipart==0.0.9
 
 SQLAlchemy==2.0.32
+
+pydantic[email]==2.9.2
