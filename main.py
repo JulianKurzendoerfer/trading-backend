@@ -1,6 +1,6 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
-from stock import router as stock_router
+import yfinance as yf
 
 app = FastAPI()
 
@@ -13,8 +13,40 @@ app.add_middleware(
 )
 
 @app.get("/api/health")
-@app.get("/health")
 def health():
     return {"ok": True}
 
-app.include_router(stock_router, prefix="/api")
+@app.get("/api/stock")
+def stock(
+    ticker: str = Query(..., min_length=1),
+    period: str = "1d",
+    interval: str = "1h",
+    limit: int = 5,
+):
+    try:
+        df = yf.Ticker(ticker).history(period=period, interval=interval)
+        if df is None or df.empty:
+            raise HTTPException(status_code=404, detail="no data")
+        out = (
+            df.reset_index()
+              .rename(columns={"Datetime": "time", "Date": "time"})
+              .head(max(1, min(limit, len(df))))
+        )
+        records = []
+        for r in out.to_dict(orient="records"):
+            t = r.get("time")
+            if hasattr(t, "isoformat"):
+                r["time"] = t.isoformat()
+            records.append({
+                "time": r["time"],
+                "open": float(r.get("Open", 0)),
+                "high": float(r.get("High", 0)),
+                "low": float(r.get("Low", 0)),
+                "close": float(r.get("Close", 0)),
+                "volume": float(r.get("Volume", 0)),
+            })
+        return {"ticker": ticker.upper(), "points": records}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
