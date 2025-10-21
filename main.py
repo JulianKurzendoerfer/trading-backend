@@ -1,11 +1,10 @@
-from fastapi import FastAPI, Request, HTTPException, Response
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-import time, io, datetime as dt
-import requests
+import requests, io, time, datetime as dt
 import pandas as pd
 
 try:
-    import yfinance as yf
+    import yfinance as yf  # fallback
 except Exception:
     yf = None
 
@@ -19,115 +18,103 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-_cache = {}
-_TTL = 120
+_CACHE = {}
+_TTL = 180
 
-def _now():
-    return int(time.time())
+def _now(): return int(time.time())
 
-def _period_days(p: str) -> int:
-    p = (p or "").lower()
-    if p.endswith("y"): return int(p[:-1] or 1) * 365
-    if p.endswith("mo"): return int(p[:-2] or 1) * 30
-    if p.endswith("d"): return int(p[:-1] or 1)
-    return 365
+def _build_points(df: pd.DataFrame):
+    if df is None or df.empty: 
+        return []
+    if "Date" in df.columns:
+        tcol = "Date"
+    elif "Datetime" in df.columns:
+        tcol = "Datetime"
+    elif "time" in df.columns:
+        tcol = "time"
+    else:
+        return []
+    rec = []
+    for _, r in df.iterrows():
+        t = r.get(tcol)
+        if hasattr(t, "isoformat"):
+            ts = t.isoformat()
+        else:
+            try:
+                ts = pd.to_datetime(t).isoformat()
+            except Exception:
+                continue
+        rec.append({
+            "time": ts,
+            "open": float(r.get("Open", r.get("open", 0)) or 0),
+            "high": float(r.get("High", r.get("high", 0)) or 0),
+            "low":  float(r.get("Low",  r.get("low", 0))  or 0),
+            "close":float(r.get("Close",r.get("close",0)) or 0),
+            "volume":float(r.get("Volume",r.get("volume",0)) or 0),
+        })
+    return rec
 
-def _slice_period(df: pd.DataFrame, period: str):
+def _stooq_df(ticker: str):
+    url = f"https://stooq.com/q/d/l/?s={ticker.lower()}&i=d"
     try:
-        days = _period_days(period)
-        cutoff = pd.Timestamp.utcnow() - pd.Timedelta(days=days)
-        if "Date" in df.columns:
-            df = df[df["Date"] >= cutoff]
-        elif "Datetime" in df.columns:
-            df = df[df["Datetime"] >= cutoff]
-    except Exception:
-        pass
-    return df
-
-def _stooq(ticker: str):
-    try:
-        url = f"https://stooq.com/q/d/l/?s={ticker.lower()}&i=d"
-        r = requests.get(url, headers={"User-Agent":"Mozilla/5.0"}, timeout=10)
-        if r.status_code != 200 or not r.text or not r.text.strip():
+        r = requests.get(
+            url,
+            headers={
+                "User-Agent":"Mozilla/5.0",
+                "Accept":"text/csv",
+                "Cache-Control":"no-cache",
+            },
+            timeout=12,
+        )
+        if r.status_code != 200 or not r.text or "Date,Open,High,Low,Close,Volume" not in r.text.splitlines()[0]:
             return None
         df = pd.read_csv(io.StringIO(r.text))
-        if df is None or df.empty or "Date" not in df.columns:
+        if df is None or df.empty or "Date" not in df.columns: 
             return None
-        df["Date"] = pd.to_datetime(df["Date"], errors="coerce", utc=True)
-        df = df.rename(columns={"Open":"Open","High":"High","Low":"Low","Close":"Close","Volume":"Volume"})
+        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+        df = df.dropna(subset=["Date"]).rename(
+            columns={"Open":"Open","High":"High","Low":"Low","Close":"Close","Volume":"Volume"}
+        )
         return df
     except Exception:
         return None
 
-def _yfin(ticker: str, period: str, interval: str):
+def _yf_df(ticker: str, period: str, interval: str):
     if yf is None:
         return None
     try:
-        df = yf.download(tickers=ticker, period=period, interval=interval, progress=False, auto_adjust=False, threads=False)
-        if df is None or df.empty:
+        h = yf.Ticker(ticker).history(period=period or "1y", interval=interval or "1d", auto_adjust=False)
+        if h is None or h.empty:
             return None
-        if isinstance(df.index, pd.DatetimeIndex):
-            df = df.reset_index()
-            if "Date" in df.columns:
-                df["Date"] = pd.to_datetime(df["Date"], utc=True, errors="coerce")
-            if "Datetime" in df.columns:
-                df["Datetime"] = pd.to_datetime(df["Datetime"], utc=True, errors="coerce")
-        # yfinance column names: ['Open','High','Low','Close','Adj Close','Volume']
-        want = ["Open","High","Low","Close","Volume"]
-        for w in want:
-            if w not in df.columns:
-                return None
-        return df
+        h = h.rename(columns={"Adj Close":"Close"}).reset_index()
+        return h
     except Exception:
         return None
-
-def _records_from_df(df: pd.DataFrame):
-    ts_col = "Date" if "Date" in df.columns else ("Datetime" if "Datetime" in df.columns else None)
-    if ts_col is None:
-        return []
-    out = []
-    for _, r in df.iterrows():
-        t = r.get(ts_col)
-        t_iso = t.isoformat() if hasattr(t, "isoformat") else str(t)
-        out.append({
-            "time": t_iso,
-            "open": float(r.get("Open", 0) or 0),
-            "high": float(r.get("High", 0) or 0),
-            "low": float(r.get("Low", 0) or 0),
-            "close": float(r.get("Close", 0) or 0),
-            "volume": float(r.get("Volume", 0) or 0),
-        })
-    return out
 
 @app.get("/")
 def root():
     return {"ok": True, "endpoints": ["/api/health", "/api/stock?ticker=AAPL&period=1y&interval=1d"]}
 
+@app.head("/api/health")
 @app.get("/api/health")
 def health():
     return {"ok": True}
 
-@app.head("/api/health")
-def health_head():
-    return Response(status_code=200)
-
 @app.get("/api/stock")
-def stock(ticker: str, period: str = "1y", interval: str = "1d"):
+def stock(ticker: str, period: str = "1y", interval: str = "1d", request: Request = None):
     key = (ticker.upper(), period, interval)
-    ts = _cache.get(key, (0, None))[0]
-    if _now() - ts <= _TTL:
-        return _cache[key][1]
+    hit = _CACHE.get(key)
+    if hit and _now() - hit["ts"] < _TTL:
+        return hit["data"]
 
-    df = _stooq(ticker)
+    df = _stooq_df(ticker)
     if df is None or df.empty:
-        df = _yfin(ticker, period, interval)
-    if df is None or df.empty:
-        resp = {"ticker": ticker.upper(), "points": []}
-        _cache[key] = (_now(), resp)
-        return resp
+        df = _yf_df(ticker, period, interval)
 
-    df = _slice_period(df, period)
-    rec = _records_from_df(df)
-    resp = {"ticker": ticker.upper(), "points": rec}
-    _cache[key] = (_now(), resp)
-    return resp
+    pts = _build_points(df)
+    if not pts:
+        raise HTTPException(status_code=502, detail="no data")
+
+    data = {"ticker": ticker.upper(), "points": pts}
+    _CACHE[key] = {"ts": _now(), "data": data}
+    return data
