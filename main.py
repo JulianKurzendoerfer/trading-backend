@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 import yfinance as yf
 
@@ -17,36 +17,43 @@ def health():
     return {"ok": True}
 
 @app.get("/api/stock")
-def stock(
-    ticker: str = Query(..., min_length=1),
-    period: str = "1d",
-    interval: str = "1h",
-    limit: int = 5,
-):
+def stock(ticker: str, period: str = "1y", interval: str = "1d"):
     try:
-        df = yf.Ticker(ticker).history(period=period, interval=interval)
+        def fetch_df():
+            df = yf.download(
+                ticker,
+                period=period,
+                interval=interval,
+                auto_adjust=False,
+                progress=False,
+                threads=False,
+            )
+            if df is None or df.empty:
+                df2 = yf.Ticker(ticker).history(period=period, interval=interval)
+                return df2 if df2 is not None else df
+            return df
+
+        df = fetch_df()
         if df is None or df.empty:
-            raise HTTPException(status_code=404, detail="no data")
-        out = (
-            df.reset_index()
-              .rename(columns={"Datetime": "time", "Date": "time"})
-              .head(max(1, min(limit, len(df))))
-        )
+            return {"ticker": ticker.upper(), "points": []}
+
+        df = df.reset_index()
+        ts_col = next((c for c in ["Date","Datetime","date","Time","time"] if c in df.columns), None)
+        if ts_col is None:
+            return {"ticker": ticker.upper(), "points": []}
+
         records = []
-        for r in out.to_dict(orient="records"):
-            t = r.get("time")
-            if hasattr(t, "isoformat"):
-                r["time"] = t.isoformat()
+        for r in df.to_dict(orient="records"):
+            t = r.get(ts_col)
+            ts = t.isoformat() if hasattr(t, "isoformat") else str(t)
             records.append({
-                "time": r["time"],
-                "open": float(r.get("Open", 0)),
-                "high": float(r.get("High", 0)),
-                "low": float(r.get("Low", 0)),
-                "close": float(r.get("Close", 0)),
-                "volume": float(r.get("Volume", 0)),
+                "time": ts,
+                "open": float(r.get("Open", 0) or 0),
+                "high": float(r.get("High", 0) or 0),
+                "low":  float(r.get("Low", 0) or 0),
+                "close":float(r.get("Close", 0) or 0),
+                "volume": float(r.get("Volume", 0) or 0),
             })
         return {"ticker": ticker.upper(), "points": records}
-    except HTTPException:
-        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
