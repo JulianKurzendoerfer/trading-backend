@@ -169,3 +169,18 @@ def get_stock(
                 "used_interval": interval,
             },
         )
+
+# ==== AUTH attach (router + guard + CORS) ====
+from fastapi.middleware.cors import CORSMiddleware
+from auth import router as auth_router, guard_middleware
+import os
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[o.strip() for o in os.getenv("CORS_ORIGINS","https://tool.market-vision-pro.com").split(",")],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+app.include_router(auth_router)
+app.middleware("http")(guard_middleware)
