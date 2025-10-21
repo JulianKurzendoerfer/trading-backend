@@ -184,3 +184,6 @@ app.add_middleware(
 )
 app.include_router(auth_router)
 app.middleware("http")(guard_middleware)
+@app.get("/health")
+async def health():
+    return {"ok": True}
