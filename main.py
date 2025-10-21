@@ -1,12 +1,11 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-import pandas as pd, time
-try:
-    import yfinance as yf
-except Exception:
-    yf = None
+from fastapi.responses import JSONResponse
+import pandas as pd
+import yfinance as yf
 
 app = FastAPI()
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["https://tool.market-vision-pro.com"],
@@ -15,67 +14,60 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-@app.get("/api/health")
-@app.head("/api/health")
+@app.api_route("/api/health", methods=["GET","HEAD"])
+@app.api_route("/health", methods=["GET","HEAD"])
 def health():
     return {"ok": True}
 
-def _records(df):
-    if df is None or len(df) == 0:
+@app.get("/", include_in_schema=False)
+def root():
+    return {"ok": True, "endpoints": ["/api/health", "/api/stock?ticker=AAPL&period=1y&interval=1d"]}
+
+def _records(df: pd.DataFrame):
+    if df is None or df.empty:
         return []
-    df = df.copy()
-    ts_col = None
-    for c in ("Date","Datetime","date","time","Time"):
-        if c in df.columns:
-            ts_col = c
-            break
+    df = df.reset_index()
+    ts_col = next((c for c in ["Date","Datetime","date","Time","time"] if c in df.columns), None)
     if ts_col is None:
-        df = df.reset_index()
-        for c in ("Date","Datetime","date","time","index"):
-            if c in df.columns:
-                ts_col = c
-                break
+        return []
     out = []
     for _, r in df.iterrows():
         t = r[ts_col]
-        t_iso = t.isoformat() if hasattr(t,"isoformat") else str(t)
+        t = t.isoformat() if hasattr(t, "isoformat") else str(t)
         out.append({
-            "time": t_iso,
-            "open": float(r.get("Open", r.get("open", 0)) or 0),
-            "high": float(r.get("High", r.get("high", 0)) or 0),
-            "low": float(r.get("Low", r.get("low", 0)) or 0),
-            "close": float(r.get("Close", r.get("close", 0)) or 0),
-            "volume": float(r.get("Volume", r.get("volume", 0)) or 0),
+            "time": t,
+            "open": float(r.get("Open", 0) or 0),
+            "high": float(r.get("High", 0) or 0),
+            "low": float(r.get("Low", 0) or 0),
+            "close": float(r.get("Close", 0) or 0),
+            "volume": float(r.get("Volume", 0) or 0),
         })
     return out
 
-def _yf(ticker, period, interval):
-    if yf is None:
-        return None
-    last = None
-    for _ in range(3):
-        try:
-            df = yf.download(
-                ticker, period=period, interval=interval,
-                progress=False, auto_adjust=False, prepost=False, threads=False
-            )
-            if df is not None and not df.empty:
-                if "Adj Close" in df.columns and "Close" not in df.columns:
-                    df = df.rename(columns={"Adj Close":"Close"})
-                return df.reset_index()
-        except Exception as e:
-            last = e
-        time.sleep(1)
+def _yf(ticker: str, period: str, interval: str):
+    try:
+        df = yf.download(
+            ticker,
+            period=period,
+            interval=interval,
+            auto_adjust=False,
+            progress=False,
+            threads=False,
+        )
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            return df
+    except Exception:
+        pass
     return None
 
-def _stooq(ticker):
+def _stooq(ticker: str):
     try:
         url = f"https://stooq.com/q/d/l/?s={ticker.lower()}&i=d"
         df = pd.read_csv(url)
-        if df is None or df.empty:
+        if df is None or df.empty or "Date" not in df.columns:
             return None
-        if "Date" in df.columns:
-            df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+        df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+        df.rename(columns={"Open":"Open","High":"High","Low":"Low","Close":"Close","Volume":"Volume"}, inplace=True)
         return df
     except Exception:
         return None
@@ -85,6 +77,4 @@ def stock(ticker: str, period: str="1y", interval: str="1d"):
     df = _yf(ticker, period, interval)
     if df is None or df.empty:
         df = _stooq(ticker)
-    if df is None or df.empty:
-        return {"ticker": ticker.upper(), "points": []}
     return {"ticker": ticker.upper(), "points": _records(df)}
